@@ -1,0 +1,77 @@
+====================================================================
+AVS corpus report
+====================================================================
+No personal data appears below. Counts, error codes and field
+SHAPES only — never a name, a date, an address or a payload.
+
+images    : 22
+decoders  : zxing-cpp, opencv
+budget    : 8.0s per image
+trust     : 5 certificate(s) from certs
+
+====================================================================
+1. DECODE RATE   (safe to share)
+====================================================================
+  overall : 5/22  =  22.7%
+  time    : median 7.2s   p90 8.5s   max 8.7s
+  variants: mean 1.4 tried before success
+
+  by condition:
+    phone-a-dim                    0/4      0.0%
+    phone-a-good-light             3/4     75.0%
+    phone-b-angled                 1/6     16.7%
+    phone-b-glare                  0/4      0.0%
+    phone-b-good-light             0/2      0.0%
+    scanner                        1/2     50.0%
+
+  failure reasons:
+    QR_NOT_FOUND                 17
+
+  decoder that succeeded:
+    zxing-cpp                    5
+
+  preprocessing strategy that succeeded:
+    original                     5
+
+====================================================================
+2. SIGNATURE VERIFICATION   ***  the only thing that approves  ***
+====================================================================
+    VERIFIED                         5
+      (via a lapsed certificate)     5
+
+  >>> Real Aadhaar cards VERIFIED against UIDAI's own public key.
+      Steps 1, 2 and 6 are now proven against reality.
+
+====================================================================
+3. FIELD_MAPS VALIDATION   ***  the important one  ***
+====================================================================
+  shape of every payload that DECODED:
+    len=3000-3499 digits=y                   5
+
+  payloads parsed : 5
+  QR versions     : {'V2': 5}
+
+  field presence (how many cards had each field non-empty):
+    name               5/5
+    dob                5/5
+    gender             5/5
+    aadhaar_last4      5/5
+    care_of            5/5
+    house              5/5
+    street             5/5
+    landmark           5/5
+    location           5/5
+    vtc                5/5
+    sub_district       0/5  <-- empty on all (optional field, normal at small n)
+    district           5/5
+    state              5/5
+    pincode            5/5
+    post_office        5/5
+
+  No shape mismatches. Every field held content of the expected
+  kind — dates in dob, 6 digits in pincode, M/F/T in gender.
+  FIELD_MAPS ordering is CONFIRMED against real cards.
+
+====================================================================
+Send this file. Do not send the images.
+====================================================================

@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check src tests
+
+      - name: Format check
+        run: ruff format --check src tests
+
+      - name: Type check
+        run: mypy
+
+      - name: Test
+        run: pytest -v --cov=avs --cov-report=term-missing
+
+      - name: Contract conformance
+        run: pytest tests/unit/test_contracts.py tests/unit/test_ai_boundary.py -v
+
+      - name: Guard against committed Aadhaar data
+        run: |
+          if git ls-files | grep -Ei '(corpus/|_real\.(jpg|png)|\.aadhaar)'; then
+            echo "::error::Aadhaar data must never be committed"
+            exit 1
+          fi
