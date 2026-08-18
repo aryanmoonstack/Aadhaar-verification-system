@@ -1,7 +1,7 @@
 # CONTRACTS — Frozen Interfaces
 
 **Frozen:** Step 0 · 13 August 2026
-**Version:** 1.7.0
+**Version:** 1.9.0
 
 > ## ⛔ READ BEFORE CHANGING ANYTHING IN THIS FILE
 >
@@ -182,9 +182,32 @@ something built in week 1.
 | `NameMatcher` | `ai/namematch/` | 18 |
 | `IdentityBinder` | `matching/` | 18 |
 
+Every one of them is loaded through a single component:
+
+| Component | Provides | Step |
+|---|---|:---:|
+| `ai/modelmgr/registry.py` | `ModelSpec`, `ModelRegistry` — SHA-256-pinned model files | 12 |
+| `ai/modelmgr/runtime.py` | `ModelRunner`, `InferenceOutcome` — bounded, degrading inference | 12 |
+| `ai/classify/` | `build_classifier()`, `HeuristicClassifier`, `OnnxDocumentClassifier`, `extract_features()` | 13 |
+
 **Optional-by-design:** every AI Protocol may be absent at runtime. The pipeline
 accepts `None` for each and continues deterministically. AI is an accelerator,
 never a dependency.
+
+**What Step 12 turns from intention into mechanism.** "Optional" was previously a
+convention each AI module had to honour separately, and five modules honouring a
+convention separately is five chances to get it wrong. `ModelRunner` now owns
+every failure path — absent model, absent `onnxruntime`, failed digest, throwing
+graph, hanging graph, empty output — and each ends in `None`, meaning *carry on
+deterministically*. `ModelRunner.with_fallback()` is the shape every AI module
+uses, so no module can forget its fallback.
+
+**Models are pinned like certificates.** An ONNX graph is executable content
+interpreted by `onnxruntime`, so `models.json` records a SHA-256 for each file
+and the registry refuses any file that differs — the same reasoning as
+`certs/FINGERPRINTS.txt`. A model is capped by `max_inference_ms` (default 500ms,
+against a 12s document budget); a model that exceeds it is abandoned, not waited
+for.
 
 ---
 
@@ -210,9 +233,39 @@ hallucinates, the worst outcome is a re-upload prompt — **never a false approv
 Forging an approval would require UIDAI's private key, which no amount of image
 enhancement can produce.
 
-**Enforcement:** `rules/` accepts only `CheckOutcome` objects. It has no access to
-model confidences. A test in `tests/unit/test_ai_boundary.py` asserts that no AI
-module is importable from `avs.rules`.
+**Enforcement, in both directions.** `rules/` accepts only `CheckOutcome`
+objects and has no access to model confidences. `tests/unit/test_ai_boundary.py`
+then asserts, by AST inspection of every source file:
+
+1. No decision module (`rules`, `crypto`, `parser`, `truststore`) imports `avs.ai`.
+2. **No `avs.ai` module imports `avs.crypto`, `avs.rules`, `avs.truststore` or
+   `avs.parser`.** Added in Step 12. This is the more likely accident of the two:
+   the natural shape of *"I just need a bit more context here"* is an import, and
+   a model that can see a signature is one refactor away from influencing it.
+3. `InferenceOutcome` — what every model returns — has no field an approval could
+   be read from (`verdict`, `verified`, `is_genuine`, `authentic`,
+   `signature_valid`, `approved`, `valid`). A type-level guard catching what an
+   import check cannot.
+4. Every AI parameter on `DocumentVerifier.__init__` defaults to `None`.
+
+**Step 13 — the first AI output to reach the verdict object.** Everything before
+it was upstream of the decision (preprocessing) or outside the service entirely
+(the browser pre-check). The classifier is the first component whose output
+travels alongside a verdict, so the boundary is now enforced at runtime as well
+as by module layout:
+
+| | |
+|---|---|
+| **When it runs** | Only after `rules.decide()` has returned, and only when the verdict is `UNREADABLE` |
+| **What it may write** | `user_message` and `ai_trace` |
+| **What it may not write** | `verdict`, `proof`, `checks`, `error` — it never receives them |
+| **A VERIFIED document** | Is never classified at all. No output exists that would have to be ignored |
+
+`tests/unit/test_classify_never_changes_verdict.py` runs the whole pipeline
+against a classifier that returns *every* `DocType` at confidence 1.0 and
+asserts the verdict, proof, error and check list are identical to the run with
+no classifier at all. A component that lies about everything, with total
+certainty, still cannot move the outcome.
 
 ---
 
@@ -462,6 +515,8 @@ them: run the existing pipeline on each side, then produce one
 | Version | Date | Change |
 |---|---|---|
 | 1.0.0 | 2026-08-13 | Initial freeze (Step 0) |
+| 1.9.0 | 2026-08-17 | **§6 gains `ai/classify/`; §7 gains the runtime rules for AI output that travels with a verdict (Step 13).** Additive — `DocumentClassifier` was already declared in §6 and is unchanged. The new material is §7's table of what the classifier may and may not write, and the fact that a VERIFIED document is never classified at all. Consumers reviewed: `pipeline/` (gains an optional `classifier=` parameter, default `None`); `api/`, Spring and Next.js unchanged — refinement only alters `user_message`, which they already display verbatim. |
+| 1.8.0 | 2026-08-17 | **§6 gains the model registry and inference runtime; §7's enforcement becomes bidirectional (Step 12).** Additive — no existing interface changes. §6 documents `ai/modelmgr/`, which makes "optional-by-design" a mechanism rather than a convention: one component owns every model failure path, and models are SHA-256-pinned exactly as UIDAI certificates are. §7 now states the reverse boundary — the AI layer may not import the decision layer — plus the type-level guard on `InferenceOutcome`. Consumers reviewed: `ai/` (empty until Step 13, so nothing to migrate); `pipeline/` unchanged. |
 | 1.7.0 | 2026-08-14 | **§8 gains the observability surface (Step 9).** Additive. `avs_decode_rate` and the per-stage counters make the project's primary metric visible in production for the first time — it previously existed only in `scripts/corpus_report.py`, which is why a 22.7% real-world rate went unnoticed. Adds `X-Request-ID` correlation, `avs_certificate_pinning`, and the `/ready` fields `pinning_enabled`, `tenants`, `auth_required`, `audit_enabled`. Consumers reviewed: `api/` (this step), Spring `AvsClient` (Step 10 — should forward `X-Request-ID`). |
 | 1.6.0 | 2026-08-14 | **§8 gains mandatory HMAC authentication on every `/v1` route (Step 8).** Additive — no existing field or verdict changes. Step 7 shipped with none, so anything that could reach the port could submit a document and receive a verdict. Same construction as the Step 7 callback dispatcher, so the HRM implements one scheme in both directions. Health probes stay open. Consumers reviewed: `api/` (this step), Spring `AvsClient` (Step 10, not yet built — must sign requests), Next.js UI (Step 11, calls the HRM, never AVS directly). |
 | 1.5.0 | 2026-08-14 | **§4 gains the canonical field ORDER, transcribed from UIDAI's specification.** Additive — no existing name changes. Motivation: the order had been inferred rather than sourced, and `FIELD_MAPS` carried a phantom leading `_version` field that UIDAI's format does not contain. The test fixture emitted the same phantom field, so fixture and parser agreed while both disagreed with every real card. Recorded here so the order can never again be re-derived from intuition. Consumers reviewed: `parser/` (corrected), `ocr/` (Step 17), `matching/` (Step 18). |

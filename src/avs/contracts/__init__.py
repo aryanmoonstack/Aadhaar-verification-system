@@ -66,7 +66,7 @@ from avs.contracts.protocols import (
     VerdictEngine,
 )
 
-CONTRACT_VERSION = "1.3.0"
+CONTRACT_VERSION = "1.9.0"
 """Bumped only when CONTRACTS.md changes. Consumers may assert against this."""
 
 __all__ = [

@@ -17,10 +17,12 @@ Commands are added as their steps complete:
     Step 7  ✅ serve
     Step 8  ✅ serve --tenants (HMAC auth)
     Step 9  ✅ certs pin · audit verify
+    Step 12 ✅ models status · models pin
 """
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
@@ -957,6 +959,288 @@ def serve(
         require_auth=not no_auth,
     )
     uvicorn.run(application, host=host, port=port, reload=reload, log_config=None)
+
+
+@app.command("classify")
+def classify_command(
+    target: list[Path] = typer.Argument(..., help="An image file, or a FOLDER of images"),
+    model_dir: Path = typer.Option(Path("models"), "--models", help="Model directory"),
+) -> None:
+    """Classify an image — or every image in a folder — and show the features.
+
+    ⚠ ADVISORY ONLY. This cannot verify anything and cannot reject anything. It
+      answers "does this look like a document?" so that a failed verification
+      can say something true instead of "retake it in better light".
+
+    UNKNOWN is a normal, common answer. The heuristic backend claims exactly one
+    thing — that an image contains no document at all — and says UNKNOWN to
+    every other question, because it has no trained model behind it.
+
+    ⛔ ACCEPTS A FOLDER ON PURPOSE.
+
+       This originally demanded one file path. Documenting it meant writing a
+       placeholder filename, and a pasted placeholder is not a path — PowerShell
+       split `<pick any file>` on its spaces and typer reported "unexpected extra
+       argument", which tells the user nothing about what went wrong.
+
+       Pointing at a folder needs no filename, so there is nothing to guess and
+       nothing to paste wrongly. `list[Path]` also means a shell glob that
+       expands to many paths still works instead of erroring.
+    """
+    configure_logging(json_output=False)
+
+    import numpy as np
+
+    from avs.ai.classify import build_classifier
+    from avs.ai.classify.features import extract_features
+
+    # ⛔ A leftover placeholder is the most likely bad input, so name it rather
+    #    than emitting a generic "no such file". An error that does not say what
+    #    to do next is only marginally better than no error.
+    for candidate in target:
+        text = str(candidate)
+        if any(character in text for character in "<>*?") and not candidate.exists():
+            console.print(
+                f"[bold red]That looks like a placeholder, not a path:[/bold red] {text}\n\n"
+                "Point at the FOLDER instead — no filename needed:\n"
+                r"    python -m avs.cli classify C:\aadhaar-corpus\phone-a-dim"
+            )
+            raise typer.Exit(code=2)
+
+    images: list[Path] = []
+    for candidate in target:
+        if candidate.is_dir():
+            images.extend(sorted(p for p in candidate.rglob("*") if p.is_file()))
+        elif candidate.is_file():
+            images.append(candidate)
+        else:
+            console.print(f"[bold red]No such file or folder:[/bold red] {candidate}")
+            raise typer.Exit(code=2)
+
+    if not images:
+        console.print(f"[yellow]No files found in {target[0]}.[/yellow]")
+        raise typer.Exit(code=1)
+
+    # ⛔ Opts INTO the retired heuristic deliberately. `build_classifier()`
+    #    defaults to False because the heuristic caught 0 of 19 real
+    #    wrong-uploads, but this command is a diagnostic — its whole job is to
+    #    show what the features measure, which is exactly how that was found.
+    classifier = build_classifier(str(model_dir), allow_heuristic=True)
+    if classifier is None:
+        console.print("[yellow]No classifier available.[/yellow]")
+        raise typer.Exit(code=1)
+
+    from avs.ai.classify import HeuristicClassifier
+
+    if isinstance(classifier, HeuristicClassifier):
+        console.print(
+            "[dim]Backend: heuristic (RETIRED from production — caught 0 of 19 real\n"
+            "wrong-uploads). Shown here for diagnostics only.[/dim]"
+        )
+
+    import cv2
+
+    decoded_any = False
+    for path in images:
+        decoded = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if decoded is None:
+            # Not an image. Skipped silently when scanning a folder — corpus
+            # directories routinely hold stray notes and thumbnails.
+            if len(images) == 1:
+                console.print(f"[bold red]Could not decode:[/bold red] {path}")
+                raise typer.Exit(code=2)
+            continue
+
+        decoded_any = True
+        features = extract_features(decoded)
+        prediction = classifier.classify_features(features)  # type: ignore[union-attr]
+        _print_classification(path, features, prediction, single=len(images) == 1)
+
+    if not decoded_any:
+        console.print("[yellow]None of those files could be decoded as images.[/yellow]")
+        raise typer.Exit(code=1)
+
+
+def _print_classification(path: Path, features, prediction, *, single: bool) -> None:
+    colour = {"not_a_document": "yellow", "unknown": "dim"}.get(prediction.doc_type.value, "green")
+
+    console.print(
+        f"\n[bold]{path.name}[/bold]  ->  [bold {colour}]{prediction.doc_type.value}"
+        f"[/bold {colour}] (confidence {prediction.confidence:.2f}, "
+        f"backend {prediction.model_version})"
+    )
+
+    row = features.as_row()
+    if single:
+        table = Table(header_style="bold", title="Measured features")
+        table.add_column("Feature")
+        table.add_column("Value", justify="right")
+        for key, value in row.items():
+            table.add_row(key, f"{value:.4f}" if isinstance(value, float) else str(value))
+        console.print(table)
+    else:
+        # ★ The three numbers that decide the answer. Printing all ten per image
+        #   across a folder buries them.
+        console.print(
+            f"    [dim]edge={row['edge_density']:.4f}  "
+            f"brightness={row['mean_brightness']:.1f}  "
+            f"qr={'yes' if row['has_qr'] else 'no'}  "
+            f"quad={'yes' if row['has_document_quad'] else 'no'}[/dim]"
+        )
+
+    if single and prediction.doc_type.value == "unknown":
+        console.print(
+            "\n[dim]UNKNOWN changes nothing — the deterministic message stands. "
+            "Without a trained model this is the expected answer for anything "
+            "that is not obviously empty.[/dim]"
+        )
+
+
+models_app = typer.Typer(help="AI model registry (Step 12).", no_args_is_help=True)
+app.add_typer(models_app, name="models")
+
+
+@models_app.command("status")
+def models_status(
+    model_dir: Path = typer.Option(Path("models"), "--dir", "-d", help="Model directory"),
+) -> None:
+    """Show declared models, their pinned digests, and any that cannot be used.
+
+    ⚠ An empty registry is a HEALTHY state, not a warning. Every AI capability
+      is optional and the deterministic pipeline is complete without any of
+      them — see CONTRACTS.md §6. This command exits 0 with no models declared.
+    """
+    configure_logging(json_output=False)
+
+    from avs.ai.modelmgr import RegistryError, load_registry, onnxruntime_available
+
+    try:
+        registry = load_registry(model_dir)
+    except RegistryError as exc:
+        console.print(f"[bold red]MODEL REGISTRY ERROR[/bold red]\n{exc.message}")
+        raise typer.Exit(code=2) from exc
+
+    runtime_ok = onnxruntime_available()
+    console.print(
+        "onnxruntime: "
+        + ("[green]installed[/green]" if runtime_ok else "[yellow]not installed[/yellow]")
+    )
+
+    if not registry.names:
+        console.print(
+            f"\n[dim]No models declared in {model_dir}. "
+            f"This is normal — the deterministic pipeline runs without them.[/dim]"
+        )
+        return
+
+    table = Table(header_style="bold")
+    table.add_column("Model")
+    table.add_column("Version")
+    table.add_column("State")
+    table.add_column("Digest", overflow="fold")
+
+    problems = 0
+    for name in registry.names:
+        spec = registry.get(name)
+        if spec is None:
+            table.add_row(name, "—", "[dim]disabled[/dim]", "—")
+            continue
+        # Calling path_for is what performs the digest check.
+        usable = registry.path_for(name) is not None
+        if usable:
+            state = "[green]pinned ✓[/green]"
+        else:
+            state = "[bold red]UNUSABLE[/bold red]"
+            problems += 1
+        table.add_row(name, spec.version, state, spec.sha256[:16] + "…")
+
+    console.print(table)
+
+    for name, reason in registry.problems.items():
+        console.print(f"[red]{name}:[/red] {reason}")
+
+    if problems:
+        # ⛔ Non-zero, but the SERVICE still runs. This tells an operator that a
+        #    capability is missing; it does not mean verification is broken.
+        console.print(
+            "\n[dim]Verification still works. These models are accelerators, "
+            "not requirements.[/dim]"
+        )
+        raise typer.Exit(code=1)
+
+
+@models_app.command("pin")
+def models_pin(
+    model_dir: Path = typer.Option(Path("models"), "--dir", "-d", help="Model directory"),
+) -> None:
+    """Print the SHA-256 of every .onnx file, ready to paste into models.json.
+
+    ⛔ Only run this on files you obtained deliberately. Pinning re-reads
+       whatever is on disk, so pinning a file someone else placed there records
+       their model as the expected one — which defeats the check entirely. This
+       is the same hazard as `certs pin`.
+    """
+    import hashlib
+
+    files = sorted(Path(model_dir).glob("*.onnx"))
+    if not files:
+        console.print(f"[yellow]No .onnx files in {model_dir}.[/yellow]")
+        return
+
+    #: SHA-256 of zero bytes. Pinning this means pinning an empty file — the
+    #: digest is perfectly valid and every later check passes, which is exactly
+    #: what makes it dangerous.
+    empty_digest = hashlib.sha256(b"").hexdigest()
+
+    entries: list[dict[str, str]] = []
+    rejected = 0
+
+    for path in files:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+        hexdigest = digest.hexdigest()
+        size = path.stat().st_size
+
+        # ⛔ Refuse to pin something that cannot be a model.
+        #
+        #    A digest over garbage is still a VALID digest: `models status` would
+        #    show "pinned ✓" and the operator would reasonably believe the model
+        #    was verified. Pinning is meant to answer "is this the file we
+        #    chose?" — it says nothing about whether the file is a model at all,
+        #    so that gap has to be closed here, at the only point a human looks.
+        if hexdigest == empty_digest or size == 0:
+            console.print(f"[bold red]✗ {path.name} is EMPTY — refusing to pin.[/bold red]")
+            rejected += 1
+            continue
+
+        if size < 1024:
+            # Real ONNX graphs are kilobytes at minimum; the smallest model this
+            # project will ship is a few hundred KB.
+            console.print(
+                f"[yellow]⚠ {path.name} is only {size} bytes — too small to be a "
+                f"real model. Pinning it anyway, but check it.[/yellow]"
+            )
+
+        entries.append(
+            {
+                "name": path.stem,
+                "version": "1.0.0",
+                "filename": path.name,
+                "sha256": hexdigest,
+            }
+        )
+
+    if not entries:
+        console.print(f"[yellow]Nothing to pin ({rejected} file(s) rejected).[/yellow]")
+        raise typer.Exit(code=1)
+
+    console.print(json.dumps({"models": entries}, indent=2))
+    console.print(
+        f"\n[dim]Review the names and versions, then save as "
+        f"{Path(model_dir) / 'models.json'}.[/dim]"
+    )
 
 
 audit_app = typer.Typer(help="Hash-chained audit trail.", no_args_is_help=True)

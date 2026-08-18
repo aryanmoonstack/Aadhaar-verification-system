@@ -246,6 +246,16 @@ def rotate(image: np.ndarray, degrees: int) -> np.ndarray:
     raise ValueError(f"only multiples of 90 are supported, got {degrees}")
 
 
+#: Distance between adjacent finder-pattern centres, in marker widths.
+#:
+#: ⛔ Derived from QR geometry, not tuned: for an N-module code the leg is
+#:    (N - 7) modules and a finder pattern is 7, so the ratio is (N - 7) / 7.
+#:    These bounds span roughly versions 7 to 30. Aadhaar's Secure QR is
+#:    version 21-22, landing at 12.9-13.4.
+MIN_LEG_TO_MARKER = 5.0
+MAX_LEG_TO_MARKER = 20.0
+
+
 def find_qr_region(image: np.ndarray, min_marker: int = 6) -> tuple[int, int, int, int] | None:
     """Locate a QR by its three finder patterns. Returns (x, y, w, h) or None.
 
@@ -266,6 +276,7 @@ def find_qr_region(image: np.ndarray, min_marker: int = 6) -> tuple[int, int, in
     what lets the caller size its working image to the QR instead of guessing.
     """
     best: tuple[int, int, int, int] | None = None
+    best_marker = 0.0
 
     for block in (31, 61, 101):
         try:
@@ -311,8 +322,39 @@ def find_qr_region(image: np.ndarray, min_marker: int = 6) -> tuple[int, int, in
             xs = [m[0] for m in trio] + [m[0] + m[2] for m in trio]
             ys = [m[1] for m in trio] + [m[1] + m[3] for m in trio]
             box = (min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys))
-            big_enough = box[2] > min_marker * 3 and box[3] > min_marker * 3
-            if big_enough and (best is None or box[2] * box[3] > best[2] * best[3]):
+
+            if box[2] <= min_marker * 3 or box[3] <= min_marker * 3:
+                continue
+
+            # ⛔ A QR IS SQUARE. Measured on a real corpus, this check was absent
+            #    and the function returned a 2788x5417 region — aspect 0.51 —
+            #    as a "QR". Five of six such regions were non-square, and none
+            #    of the six decoded even when cropped and upscaled 4x.
+            #
+            #    The tolerance allows for perspective: a card photographed at an
+            #    angle skews the finder-pattern bounding box, but never to 2:1.
+            aspect = box[2] / box[3] if box[3] else 0.0
+            if not (0.72 <= aspect <= 1.39):
+                continue
+
+            # ⛔ SELECT BY MARKER SIZE, NOT BOX SIZE. Both alternatives were
+            #    tried against real images and both failed:
+            #
+            #      largest box  -> a phantom spanning the whole card always
+            #                      beats the real QR (the original bug; every
+            #                      corpus px_per_module inflated ~3x)
+            #      smallest box -> tiny noise contours always beat the real QR
+            #                      (measured: an 86x86 region returned for a
+            #                      700px code)
+            #
+            #    Box size is simply not the discriminator. FINDER PATTERN size
+            #    is: a real QR's markers are substantial, while the contours
+            #    that coincidentally line up are specks. Among candidates that
+            #    already satisfy the geometry and squareness constraints, the
+            #    one with the biggest markers is the real code.
+            marker_size = min(m[2] for m in trio)
+            if marker_size > best_marker:
+                best_marker = marker_size
                 best = box
 
     return best
@@ -336,7 +378,31 @@ def _is_finder_triangle(trio: list[tuple[int, int, int, int]], tolerance: float 
     expected = sides[0] * 2**0.5
     if abs(sides[2] - expected) / expected > tolerance:
         return False
-    return sides[0] > trio[0][2] * 1.5
+
+    # ⛔ THE CHECK THAT WAS ~9x TOO LOOSE.
+    #
+    #    This used to be `sides[0] > trio[0][2] * 1.5` — "the markers are more
+    #    than 1.5 marker-widths apart". Almost any three small marks on a card
+    #    satisfy that, which is why the detector reported a QR in 16 of 19
+    #    images that contain none (D136).
+    #
+    #    QR geometry pins the real value. Finder patterns are 7 modules wide and
+    #    their centres sit 3.5 modules in from each edge, so for an N-module code
+    #    the leg between adjacent centres is (N - 7) modules::
+    #
+    #        version 10  ( 57 modules)  leg / marker =  7.1
+    #        version 21  ( 97 modules)  leg / marker = 12.9   <- Aadhaar
+    #        version 22  (101 modules)  leg / marker = 13.4   <- Aadhaar
+    #        version 25  (117 modules)  leg / marker = 15.7
+    #
+    #    The window below spans roughly QR versions 7 to 30 — permissive enough
+    #    for any plausible document code, and still an order of magnitude
+    #    tighter than 1.5.
+    marker_width = trio[0][2]
+    if marker_width <= 0:
+        return False
+    leg_ratio = sides[0] / marker_width
+    return MIN_LEG_TO_MARKER <= leg_ratio <= MAX_LEG_TO_MARKER
 
 
 def find_document_quad(

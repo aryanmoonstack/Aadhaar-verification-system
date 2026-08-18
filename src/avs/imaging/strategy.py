@@ -287,11 +287,20 @@ def problems_from_quality(quality: QualityScores) -> set[Problem]:
         problems.add(Problem.RESOLUTION)
     if abs(quality.skew_degrees) > 5.0:
         problems.add(Problem.PERSPECTIVE)
-    if quality.decodability < 0.5:
-        # The model expects trouble but cannot say precisely what. Fall back to
-        # the full matrix rather than guessing wrong and skipping the one
-        # strategy that would have worked.
-        problems.update(Problem)
+    # ⛔ REMOVED: `if quality.decodability < 0.5: problems.update(Problem)`.
+    #
+    #    That existed as a safety hatch against the OLD filtering behaviour —
+    #    "the model expects trouble but cannot say what, so fall back to the
+    #    full matrix rather than skip the strategy that would have worked".
+    #
+    #    `select_strategies` no longer filters, so that safety is now structural
+    #    and the hatch is not merely redundant but harmful: marking every
+    #    problem as detected made every strategy equally relevant, which made
+    #    the ordering identical to having no quality model at all. Measured —
+    #    the blurry, glare and no-quality orderings came out byte-identical.
+    #
+    #    Low decodability with no specific finding is exactly the case where the
+    #    deterministic order should stand unchanged.
 
     return problems
 
@@ -316,15 +325,42 @@ def select_strategies(
     """
     candidates = [s for s in STRATEGIES if s.tier <= max_tier]
 
-    if quality is not None:
-        problems = problems_from_quality(quality)
-        candidates = [s for s in candidates if s.tier == 0 or (s.addresses & problems)]
+    # ⛔⛔ QUALITY REORDERS. IT MUST NEVER REMOVE.
+    #
+    #    This previously FILTERED: `[s for s in candidates if s.tier == 0 or
+    #    (s.addresses & problems)]`. Measured on the real corpus, that was a
+    #    latent D120 violation waiting for Step 14 to switch it on:
+    #
+    #      quality says "this photo looks fine"  ->  23 strategies cut to 3
+    #
+    #    and among the 20 discarded was `gray+adaptive`, the only strategy that
+    #    rescued a heavily blurred test card (original failed; adaptive
+    #    succeeded at attempt 6). Four real corpus images are sharp, bright and
+    #    well-sized yet still undecodable — precisely the inputs for which
+    #    quality reports no problem — so filtering would have removed their best
+    #    remaining chance on exactly the images that need it most.
+    #
+    #    An advisory component that can DELETE a decode attempt can cause a
+    #    failure that would not otherwise have happened. So the full matrix is
+    #    always returned; quality only decides what is tried EARLIER.
+    problems = problems_from_quality(quality) if quality is not None else set()
 
-    # Sort by tier, then by position in STRATEGIES — NOT alphabetically.
-    # Within a tier the declaration order encodes intent: "original" must be
-    # tried before "gray+clahe", because an already-good capture should decode
-    # on the very first variant and stop. Sorting by name would put "gray"
-    # first and quietly add work to every successful upload.
+    #: 0 = addresses a detected problem, so try it sooner. 1 = still tried,
+    #: just later. Never dropped.
+    relevance = {
+        strategy.name: (0 if (problems and (strategy.addresses & problems)) else 1)
+        for strategy in candidates
+    }
+
+    # Sort by tier, then relevance, then by position in STRATEGIES — NOT
+    # alphabetically. Within a tier the declaration order encodes intent:
+    # "original" must be tried before "gray+clahe", because an already-good
+    # capture should decode on the very first variant and stop. Sorting by name
+    # would put "gray" first and quietly add work to every successful upload.
+    #
+    # ⚠ Tier stays the PRIMARY key. Cheap-before-expensive outranks relevance:
+    #   a cheap strategy that might work should not be delayed behind an
+    #   expensive one merely because a heuristic finds the latter more apt.
     order = {strategy.name: index for index, strategy in enumerate(STRATEGIES)}
-    candidates.sort(key=lambda s: (s.tier, order[s.name]))
+    candidates.sort(key=lambda s: (s.tier, relevance[s.name], order[s.name]))
     return candidates[:limit] if limit else candidates

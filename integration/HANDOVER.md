@@ -83,11 +83,31 @@ import or a style nit. Send it to me and I'll fix it.
 
 | File | |
 |---|---|
+| **`components/AadhaarUpload.tsx`** | **★ USE THIS. Two-sided file upload with pre-check** |
+| `components/AadhaarCapture.tsx` | ⚠ Live camera. **Not** what M-One uses — see below |
 | `lib/qrPrecheck.ts` | Decodes the QR **in the browser before upload** |
 | `lib/captureQuality.ts` | Resolution, blur and QR-size rules |
-| `components/AadhaarCapture.tsx` | Two-sided camera capture with live guidance |
+| `lib/exif.ts` | Detects the messaging-app re-encode fingerprint |
 | `app/api/aadhaar/verify/route.ts` | Session-authenticated proxy to Spring |
-| `lib/__tests__/` | 27 tests, `tsc --strict` clean |
+| `lib/__tests__/` | 36 tests, `lib/` is `tsc --strict` clean |
+
+### ⛔ Which component to use
+
+**`AadhaarUpload.tsx`.** M-One offers file upload, not in-app capture.
+
+`AadhaarCapture.tsx` was built first and opens `getUserMedia` — it has no file
+input at all, so it does not fit the product. It is kept because the live-camera
+route remains a legitimate future option, not because it is the current one.
+
+Both share `lib/` unchanged: `precheck()` takes an `ImageBitmapSource`, and
+`File` extends `Blob`, so the same code runs on a picked file with no
+conversion.
+
+⚠ **What upload-only gives up.** Live capture can say "move closer" *while* the
+person is framing. Upload can only say "that one will not work, choose another"
+after the photo exists. 29% of measured failures were "too far back" — guidance
+in the moment would have prevented those. The pre-check still catches them, one
+step later. That is a product trade, not a technical limit.
 
 ### ⛔ Tell them this
 
@@ -105,17 +125,21 @@ photographed badly is indistinguishable from a forgery to any automated check,
 which is exactly why no automated check may call it one. Use the `userMessage`
 the service returns — it is deliberately worded.
 
-### Three capture settings that decide whether this works
+### What the upload flow must get right
 
-These are not preferences. Every 2.3 MP image in the real corpus failed to
-decode; 12.2 MP images decoded 36% of the time.
+Measured on 27 real Aadhaar photographs run through the actual decoder:
 
-- Camera requested at **3840px ideal** — a default stream is often exactly the
-  2.3 MP that failed
-- **JPEG quality 0.95**, not the 0.8 default — artefacts land precisely on the
-  high-contrast edges that define QR modules
-- Pre-check every **600ms**, not every frame — continuous decoding stutters the
-  preview, making the camera harder to hold steady
+- **Never block the upload.** A photo the browser cannot read may still decode
+  on the server, which runs 23 preprocessing variants the browser does not — and
+  on Safari the detector is simply absent. Disabling Submit on a failed
+  pre-check would lock those people out of the product.
+- **Accept HEIC.** iPhones produce it by default. The `accept` attribute already
+  lists it; the server handles it.
+- **Never downscale before upload.** A well-intentioned client-side resize
+  destroys exactly the QR resolution the decode depends on.
+- **The word "fake" must never appear** in any employee-facing string. A genuine
+  card photographed badly is indistinguishable from a forgery to any automated
+  check, which is precisely why no automated check may call it one.
 
 ### What they must write themselves
 
@@ -123,6 +147,13 @@ decode; 12.2 MP images decoded 36% of the time.
 - Styling — the component ships unstyled
 - A polling loop against `GET /api/kyc/aadhaar/status/{jobId}`
 - `npm install zxing-wasm` only if you support Safari or Firefox
+
+### ⚠ The one thing still untested anywhere
+
+`BarcodeDetector` has **never run on a real device**. The logic is type-checked
+and unit-tested against fakes, but the browser API itself is unexercised. Test
+Android Chrome first — it has the native detector. This is the single highest-
+value thing on the whole list.
 
 ---
 

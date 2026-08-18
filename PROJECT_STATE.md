@@ -13,8 +13,8 @@
 
 | | |
 |---|---|
-| **Completed** | Steps 0–11 — **🏁 MILESTONE C COMPLETE.** End to end: browser capture → HRM → AVS → verdict → permanent record. The feature is shippable. |
-| **Next** | Step 12 — ML Foundation (starts Milestone D) |
+| **Completed** | Steps 0–14 — 14 of 26. Step 14 is the first component whose thresholds were DERIVED from real decode outcomes rather than chosen, and it found three production bugs on the way. |
+| **Next** | Step 15 — QR Localiser |
 | **Milestone** | D — AI Vision Layer (Steps 12–16) |
 | **Blocked on** | Nothing. Two parallel items for Dheeraj: (a) obtain UIDAI certificates into `certs/` — until then `/ready` returns 503 and every document returns `ERROR`, which is correct; (b) run `scripts/validate_corpus.py` against real cards to confirm `FIELD_MAPS` ordering. Neither blocks Step 8. |
 
@@ -42,10 +42,10 @@ MILESTONE C — HRM Integration
   [x] Step 11  Next.js Upload Flow           🏁 SHIPPABLE FEATURE
 
 MILESTONE D — AI Vision Layer
-  [ ] Step 12  ML Foundation                ← NEXT
-  [ ] Step 13  Document Type Classifier
-  [ ] Step 14  Capture Quality Model
-  [ ] Step 15  QR Localiser
+  [x] Step 12  ML Foundation
+  [x] Step 13  Document Type Classifier
+  [x] Step 14  Capture Quality Model
+  [ ] Step 15  QR Localiser                  ← NEXT
   [ ] Step 16  On-Device Browser AI          🏁 decode rate ≥95%
 
 MILESTONE E — Decision Intelligence
@@ -95,8 +95,8 @@ module is implemented or its interface changes.**
 | `security/` | 8 | ✅ **DONE** | `verify_request_signature()`, `sign_request()`, `NonceCache`, `TenantConfig`, `TenantRegistry` (Protocol), `FileTenantRegistry`, `InMemoryTenantRegistry` | `api/` |
 | `audit/` | 9 | ✅ **DONE** | `AuditEntry`, `AuditSink` (Protocol), `FileAuditTrail`, `NullAuditSink`, `verify_chain()` | `api/`, CLI |
 | `observability/` | 9 | ✅ **folded into `api/`** | `avs_decode_rate` + per-stage counters, `RequestContextMiddleware` correlation ids | ops |
-| `ai/modelmgr/` | 12 | ⬜ stub | `load(name, version)` | all `ai/` modules |
-| `ai/classify/` | 13 | ⬜ stub | `classify() -> DocTypePrediction` | pipeline |
+| `ai/modelmgr/` | 12 | ✅ **DONE** | `ModelSpec`, `ModelRegistry`, `load_registry()`, `RegistryError`, `ModelRunner`, `InferenceSession`, `InferenceOutcome`, `onnxruntime_available()` | all `ai/` modules (13–19) |
+| `ai/classify/` | 13 | ✅ **DONE** | `build_classifier()`, `HeuristicClassifier`, `OnnxDocumentClassifier`, `DocumentFeatures`, `extract_features()`, `CLASS_ORDER` | `pipeline` (optional), CLI |
 | `ai/quality/` | 14 | ⬜ stub | `assess() -> QualityScores` | `imaging/` |
 | `ai/localize/` | 15 | ⬜ stub | `localize() -> QrRegion` | `qr/` |
 | `ocr/` | 17 | ⬜ stub | `cross_check() -> TextSimilarity` | `rules/` |
@@ -203,6 +203,36 @@ Decisions that later steps must respect. Each records where it was made.
 | D117 | **⛔ The browser NEVER calls AVS directly** | 11 | Calling AVS requires an HMAC signature and a browser cannot hold a secret — anything shipped to a client is public. Images go to the HRM, which signs server-side. A "simplifying" refactor here would put the tenant key in a JS bundle |
 | D118 | **Capture thresholds come from the Step 7.5 corpus, not intuition** | 11 | `MIN_MEGAPIXELS = 4` because every 2.3MP image failed; `PX_PER_MODULE.unrecoverable = 2.0` because nothing below it was recoverable by any strategy; `MIN_SHARPNESS = 20` because the phone-a-dim shots at 6.7-11.7 never decoded. Camera requests 3840px ideal, JPEG quality 0.95 not 0.8 — artefacts land exactly on QR module edges |
 | D119 | **A MARGINAL QR warns but does not block** | 11 | Blocking would turn away someone about to succeed: if the browser already decoded it, the server will too. Likewise when no detector is available (Safari without the optional WASM), upload proceeds — refusing because OUR accelerator is missing would lock those users out entirely |
+| D149 | **★★ CROPPING RECOVERS NOTHING — and my first reading of this was WRONG** | 14 | Reported initially as "2 of 6 crops decode that the pipeline failed on", implying 30% → 37%. **False.** `--compare-pipeline` showed the 2 images whose crops decode are EXACTLY the 2 the full pipeline already decodes; the folder was never 6 failures, it was 4 failures and 2 successes — a number already printed by the corpus run ("phone-b-good-light 2/6") and misread anyway. Decodes recovered by cropping: **0**. The consequence matters: the localiser already finds these codes, crops them at full resolution, and they still fail at 1x, 2x and 4x. So **Step 15 (better localisation) would not help** — the codes are genuinely unreadable, which is Step 19 (restoration) territory |
+| D148 | **★★ MY OWN DIAGNOSTIC USED THE WRONG DECODER, AND TOO LITTLE PADDING** | 14 | `diagnose_failures.py` judged crops with `cv2.QRCodeDetector` — the detector whose inability to read a dense Secure QR is the documented reason `find_qr_region` exists at all. It also padded crops by only 10%. Measured on a known-good 700x700 QR: the localiser reports 512x581 (the box spans finder-pattern CENTRES, so it is always smaller than the code), and cropping to it fails at 10% and 25% padding but **decodes at 50%**. So "the crop decodes at NO scale" was measuring my harness, not the image. Now uses the real cascade and 50% padding. ⚠ Production was never affected — Step 7.5's generator already pads 60% (`qr_context`) |
+| D144 | **★★★ THE BROWSER WARNED ABOUT PHOTOS THE SERVER DECODED** | 14 | `MIN_MEGAPIXELS = 4` was hand-set in Step 11 from a 22-image corpus where "every 2.3 MP image failed" was true. The corpus grew to 27 documents and the weakest capture that ACTUALLY DECODED now measures **2.31 MP** — so the browser flagged as unusable a photo the server reads perfectly. The two threshold sets were never connected, so nothing noticed. Fixed by generating `thresholds.generated.ts` from `assessor.py` via `scripts/export_thresholds.py`, with tests on both sides that fail on drift. Two vitest tests asserted the old value and were reversed |
+| D145 | **Sharpness is deliberately NOT synced to the browser** | 14 | The server floor is an OpenCV variance-of-Laplacian figure. The browser computes no sharpness at all (`FrameMeasurements.sharpness` is optional and no caller supplies it), and a JavaScript Laplacian would not share OpenCV's scale. Copying 250 across would be a number that looks authoritative and means nothing — worse than an obviously unused constant, because it reads as a decision that was made and tested |
+| D146 | **★ Darkness outranks blur when both fire — measured** | 14 | Laplacian variance scales with CONTRAST, so a perfectly focused photo taken in the dark measures as blurry. On one image at decreasing exposure, focus untouched: brightness x1.00 → sharpness 1315, x0.35 → 155, x0.12 → 22. Darkness CAUSES the low reading, so "hold steadier" sends someone to fix the wrong thing and they fail again identically. More light fixes both |
+| D147 | **`_refine_message` returned before quality could run** | 14 | The guard read `if self.classifier is None`, written when the classifier was the only advisor. Step 14 added quality, and since D135 retired the classifier the DEFAULT configuration has none — so the measured component was silently dead in the normal case. Also fixed `_classifier_name`, which recorded "NoneType" in `AiTrace`; "which model produced this?" is the first question asked when a result looks wrong |
+| D141 | **★★★ QUALITY REORDERS THE VARIANT MATRIX — it must never shrink it** | 14 | `select_strategies` FILTERED on detected problems, and Step 14 was about to switch that on. Measured: when quality reports "this photo looks fine", **23 strategies became 3** — and among the 20 discarded was `gray+adaptive`, the only strategy that rescued a heavily blurred card the original failed on (attempt 6). The four real corpus images that are sharp, bright and well-sized yet undecodable are exactly the inputs quality calls fine, so filtering would have stripped their best remaining chance on the images needing it most. Now reorders only; tier stays the primary sort key so cheap-before-expensive still wins. Two existing tests asserted the old behaviour and were reversed |
+| D142 | **The preprocessing variants DO earn their place — cutting them was the wrong instinct** | 14 | All 8 corpus successes decoded on `original`, which suggested the 18 variants were dead weight costing 4.3s per failure. Tested directly on degraded cards: `blur 21` failed on the original and was **rescued by `gray+adaptive` at attempt 6**. 1 of 2 genuinely-hard cases recovered. The matrix stays; only its order is optimised |
+| D143 | **`problems_from_quality` no longer reports every problem on low decodability** | 14 | It had `if decodability < 0.5: problems.update(Problem)` as a safety hatch against filtering. With filtering gone that safety is structural, and the hatch became harmful: marking everything as detected made every strategy equally relevant and produced an ordering **byte-identical** to having no quality model. Measured on blur, glare and no-quality inputs — all three orderings matched exactly |
+| D137 | **★★★ `find_qr_region` HAD TWO BUGS — every px_per_module was inflated ~3x** | 14 | Found by diagnosing 6 "perfect but failing" captures: all 6 located regions failed to decode even cropped and upscaled 4x, and 5 of 6 were **non-square** — one at aspect 0.51 (2788x5417). A QR is square. Root causes: (1) the finder-pattern geometry check required legs `> 1.5 x marker width` when real QR geometry gives **12.9x** for Aadhaar's version 21-22 — about 9x too loose, so any three marks on a card qualified; (2) it kept the **largest** matching candidate, so a phantom spanning the whole card always beat the real QR. Fixed with a squareness guard, a `MIN/MAX_LEG_TO_MARKER` window from QR geometry, and selection by **finder-pattern size** — "smallest box" was tried and broke real detection (86x86 returned for a 700px code). Shipping since Step 7.5 |
+| D138 | **The localiser fix did NOT raise the decode rate — and that is the finding** | 14 | Prediction was that correct cropping would unlock decodes. It did not: 8/27 before and after. Since cropping accurately to the QR changes nothing, "the code is too small in the frame" is ruled out as a cause. The remaining failures are intrinsic to the QR image — blur, glare, print quality. Measurements did become physically plausible (px/module range 1.90-42.7 -> 0.44-16.89, matching the 12.9 predicted by card geometry) and phantom detections fell 16/19 -> 11/19 |
+| D139 | **Quality thresholds come in TWO sets, because false alarms cost differently** | 14 | `POST_FAILURE` sits at the measured floor (sharpness 368.76, brightness 108.73) — it runs on an image that has ALREADY failed, so a false alarm is impossible by construction. `PRE_UPLOAD` sits ~30% lower (250, 80) because it runs in the browser before the photo has had its chance, where a false warning costs a real person a pointless retake. Coverage drops 68% -> 58%; correct trade |
+| D140 | **`px_per_module` is measured but NOT used as a rule** | 14 | Combined-coverage analysis: sharpness catches 68%, brightness a further 11% (79% total), px_per_module adds **zero** — every image it catches is already caught. A rule that never fires alone is code with no reason to exist, so it is reported and not acted on |
+| D135 | **★★★ THE HEURISTIC CLASSIFIER IS RETIRED — it caught 0 of 19 real wrong-uploads** | 13 | Measured against 19 genuine mistake-uploads (screenshots, UI mockups, keyboard, desk, sunset, face, waveform): **0 caught**. Feature ranges — documents edge 0.0000-0.1232 / brightness 41.0-174.6, negatives edge 0.0031-0.0886 / brightness 3.7-235.2. The negative range sits **entirely inside** the document range on edge density: 100% overlap, so no threshold separates them and tuning cannot help. Reason in one line: a screenshot of text IS a document image, just not an Aadhaar one — shape statistics describe STRUCTURE, and telling an Aadhaar from a PAN needs CONTENT. `build_classifier()` now defaults `allow_heuristic=False`; the class is kept as the reference implementation and for diagnostics, not deleted |
+| D136 | **`find_qr_region` false-positives on UI screenshots** | 13 | Five of the 19 negatives were swallowed by "a QR or document quad was detected". Screenshots contain concentric rounded squares — icons, buttons, cards — that look like QR finder patterns. **Harmless in preprocessing** (Step 7.5 always offers the uncropped frame as a fallback variant, and real cards decode 5/5), but it means QR-presence is not usable as evidence of "this is an Aadhaar". Relevant to Step 15's localiser: it must be scored against negatives, not only against cards |
+| D134 | **`avs classify` accepts a FOLDER, because a documented placeholder is not a path** | 13 | The command demanded one filename, so documenting it required writing `<pick any file>`. Pasted verbatim, PowerShell split it on spaces and typer said "unexpected extra argument (any file in that folder>)" — an error naming neither the cause nor the fix. Taking a folder removes the filename from the interface entirely: nothing to guess, nothing to paste wrongly. A placeholder-shaped argument is now detected by name and answered with the working command |
+| D132 | **★★ REAL DATA KILLED THE EDGE TEST — exposure gating added** | 13 | Ran `collect_classifier_features.py` on the 22-image corpus. `phone-a-dim` measured **0.0000 / 0.0019 / 0.0096** edge density — genuine Aadhaar cards, AT AND BELOW the 0.005 floor, indistinguishable from a blank frame. Underexposure destroys edge structure, so the two classes overlap completely at the low end — the opposite of what generated data implied. They escaped misclassification only because the QR/quad check fired first, which is luck, not margin. `NOT_A_DOCUMENT` now additionally requires `mean_brightness >= 60`; a dark frame is an EXPOSURE problem and "photograph it in good light" is already the right advice |
+| D133 | **★★ MY SAFETY CHECK PASSED BY MATCHING NOTHING** | 13 | The script's misfire check filtered documents with `"aadhaar" in label or "id" in label`. The real folders are `phone-a-dim`, `phone-b-angled`, `scanner` — it matched **zero rows**, so "weakest real document" never printed and the check compared against an empty set and printed ✓. Three cards were below the threshold at the time. **A green tick from a check that found nothing is worse than no check**, because a human then trusts it. The default is now inverted: everything is a document unless a folder name explicitly says otherwise, the assumption is printed, and an empty document set is reported as proving nothing |
+| D127 | **★ High edge density is NOT evidence of a document** | 13 | The obvious heuristic — "documents are dense with text, so lots of edges means a document" — is false. Measured: a brick wall and random noise both score 0.104 edge density; a real card scores 0.042. **The wall is twice as document-like on the obvious feature.** Only the LOW end survives: near-zero edges, no quad and no QR means no document. Everything else is UNKNOWN |
+| D128 | **⛔ The classifier refines the MESSAGE, never the verdict** | 13 | It runs after `rules.decide()` returns, only when the verdict is UNREADABLE, and writes only `user_message` and `ai_trace`. A VERIFIED document is never classified at all — so no model output exists that would have to be correctly ignored. `test_classify_never_changes_verdict.py` feeds the pipeline a classifier returning EVERY DocType at confidence 1.0 and asserts verdict, proof, error and checks are identical to the no-classifier run |
+| D129 | **The heuristic claims exactly one thing, and says UNKNOWN to everything else** | 13 | It never returns AADHAAR_FRONT/BACK/PVC/OTHER_ID — telling a front from a back, or an Aadhaar from a PAN, needs a trained model. Shipping a confident-sounding guess would be worse than shipping nothing, because UNKNOWN changes no behaviour while a wrong specific answer sends someone off to fix the wrong problem |
+| D130 | **Refinement requires UNANIMITY across sides** | 13 | One clear card photo plus one photo of a thumb is a CAPTURE problem, and "retake in good light" is the correct advice there. Saying "these do not appear to show a document" to someone who photographed their card correctly once would be both wrong and insulting |
+| D131 | **Thresholds set from generated images are provisional and labelled as such** | 13 | `EDGE_DENSITY_FLOOR` sits ~7x below the weakest generated document rather than midway between classes, because generated non-documents measure exactly 0.0000 — a figure no real photograph produces. The asymmetry is deliberate: a false NOT_A_DOCUMENT tells someone their genuine card is not a card, while a miss costs only the message already shown today. `scripts/collect_classifier_features.py` produces the real numbers, emitting shape statistics only |
+| D120 | **⛔ A model must never be able to fail a verification** | 12 | The single rule `ModelRunner` exists to enforce. Absent model, absent `onnxruntime`, failed digest, throwing graph, hanging graph, empty output — all six end in `None`, meaning carry on deterministically. Before this, "AI is optional" was a convention each of the five AI modules had to honour separately, which is five chances to get it wrong |
+| D121 | **Models are SHA-256 pinned, exactly like UIDAI certificates** | 12 | An ONNX graph is executable content interpreted by onnxruntime — it can carry custom operators, and a hostile one attacks the process that loads it. Dropping a file into `models/` is closer to dropping a `.so` into the library path than to editing config. `models.json` pins each digest; a mismatch is refused before onnxruntime sees the file |
+| D122 | **An EMPTY model registry is a healthy state, not a warning** | 12 | `avs models status` exits 0 with nothing declared. Treating "no models" as a failure would invert the relationship the whole AI boundary rests on — the accelerator would have become the dependency, and a missing accelerator would stand between a person and their verification |
+| D123 | **A slow model is ABANDONED, not waited for** | 12 | Inference runs on a daemon thread with `join(timeout)`. Python cannot safely kill a thread executing native code, so the thread is abandoned and its result discarded. A leaked thread for a few hundred ms is survivable; a hung verification consuming the 12s document budget — while the deterministic path was going to succeed anyway — is not |
+| D124 | **The AI boundary is now enforced in BOTH directions** | 12 | Steps 0–11 asserted the decision layer never imports `avs.ai`. Step 12 adds the reverse: no `avs.ai` module may import `crypto`, `rules`, `truststore` or `parser`. This is the more likely accident — the natural shape of "I just need a bit more context here" is an import, and a model that can see a signature is one refactor from influencing it. Plus a type-level guard: `InferenceOutcome` may never gain a field an approval could be read from |
+| D125 | **★ `CONTRACT_VERSION` is now read from CONTRACTS.md, not pinned as a literal** | 12 | Found during Step 12: the test asserted `== "1.3.0"` and passed happily while the document advanced to 1.7.0 — four steps of drift, with `avs version` reporting a contract version that had not existed for weeks. The same failure shape as the Step 7.5 `"V2"` bug: **a test that pins a literal proves only that the literal has not changed.** The test now parses the document, so the two cannot separate |
+| D126 | **★ `models pin` refuses a file that cannot be a model** | 12 | Found by running the command: a 0-byte file was pinned, printing the SHA-256 of zero bytes. The digest was valid, so every downstream check would have passed and `models status` would have shown `pinned ✓`. Pinning answers "is this the file we chose?", never "is this a model?" — the gap has to close at the CLI, the one point a human reads the values before committing them |
 | D110 | **★ Java/Python HMAC interop is PROVEN, not assumed** | 10 | Six shared vectors compared byte-for-byte: JSON body, empty body, both halves of the canonicalisation-collision pair, a BINARY multipart body, and a non-ASCII secret. A mismatched canonical string is the classic silent integration failure — everything looks right and every request 401s. The real vector is pinned in `AvsSignatureTest` |
 | D111 | **`AvsClient` builds the multipart body BY HAND** | 10 | The signature covers the exact bytes on the wire. Any library that regenerates the body — different boundary, header order or line endings — produces bytes that no longer match, and the symptom is an unexplained 401. Verified: a Java-built 305,998-byte request produced `VERIFIED` from the live Python service in 3.3s |
 | D112 | **⛔ The callback endpoint verifies the HMAC over the RAW body, BEFORE parsing** | 10 | THE most security-critical file in the integration. An unsigned callback endpoint lets anyone POST `{"verdict":"VERIFIED"}` and approve a forged Aadhaar — bypassing the RSA check, the pinned trust store and the audit trail with one request. Raw bytes because Jackson normalises key order and whitespace; before parsing because running a parser on attacker-controlled input precedes establishing who sent it |
@@ -887,3 +917,210 @@ corpus can tell us. `avs_decode_rate` must be a tracked metric from Step 9.
 - Alert on `avs_certificate_days_to_expiry < 90`; at 0 the service stops
   verifying anything
 - Step 10's Spring client codes against CONTRACTS.md §8, now matching reality
+
+---
+
+## Step 12 — ML Foundation  ·  17 August 2026
+
+**Milestone D begins.** Steps 13–19 each add a model. Without shared machinery
+each would invent its own loading, versioning and failure behaviour, and the
+pipeline would acquire five subtly different ways to break. Step 12 ships no
+model at all — it builds the thing that makes the next four safe to add.
+
+### What was built
+
+| File | |
+|---|---|
+| `src/avs/ai/modelmgr/registry.py` | `ModelSpec`, `ModelRegistry`, `load_registry()`, `RegistryError` |
+| `src/avs/ai/modelmgr/runtime.py` | `ModelRunner`, `InferenceSession`, `InferenceOutcome` |
+| `src/avs/cli.py` | `avs models status`, `avs models pin` |
+| `tests/unit/test_ai_foundation.py` | 22 tests |
+| `tests/unit/test_ai_boundary.py` | +4 tests — the reverse boundary |
+
+### Found by running it
+
+`avs models pin` on a directory holding a 0-byte file pinned it happily,
+printing `e3b0c442…` — the SHA-256 of zero bytes. A digest over garbage is
+still a *valid* digest, so `models status` would then have shown `pinned ✓` and
+an operator would reasonably have concluded the model was verified.
+
+Pinning answers *"is this the file we chose?"*. It cannot answer *"is this a
+model?"* — so the CLI now refuses empty files outright and warns below 1 KiB.
+Three regression tests cover it (D126).
+
+### The one rule
+
+**A model must never be able to fail a verification.** Six failure modes, each
+exercised by a test, each ending in "carry on deterministically":
+
+| Failure | Behaviour |
+|---|---|
+| No model declared | Empty registry, exit 0. The *normal* state |
+| `onnxruntime` absent | Logged, `None` returned |
+| Digest mismatch | Refused loudly, never loaded |
+| Model throws | `usable=False`, reason recorded |
+| Model hangs | Abandoned at `max_inference_ms` (default 500ms) |
+| Model returns nothing | `usable=False` |
+
+`ModelRunner.with_fallback()` is the shape every AI module will use, so no
+module can forget its fallback — that omission is exactly how "optional"
+degrades into "required in practice".
+
+### Why models are pinned like certificates
+
+An ONNX graph is a program. onnxruntime interprets it, it can carry custom
+operators, and a maliciously crafted one is an attack on the loading process.
+Dropping a file into `models/` is closer to dropping a `.so` into the library
+path than to adding config — so `models.json` records a SHA-256 per file and a
+mismatch is refused before onnxruntime sees it.
+
+⚠ This is defence in depth, **not** the thing standing between an attacker and
+an approval. If every model here were replaced with a hostile one, the worst
+outcome is bad preprocessing advice and a re-upload prompt. Forging an approval
+still requires UIDAI's private key.
+
+### What was found — a four-step version drift
+
+`test_contract_version_is_pinned()` asserted `CONTRACT_VERSION == "1.3.0"` and
+passed on every run while CONTRACTS.md advanced to 1.7.0. `avs version` had been
+reporting a contract version that had not existed for weeks, and nothing failed.
+
+The shape is identical to the Step 7.5 `"V2"` bug: **a test that pins a literal
+proves only that the literal has not changed.** The test now parses the version
+out of CONTRACTS.md, so the constant and the document cannot drift apart again.
+Both were bumped to 1.8.0 (D125).
+
+### Verification
+
+- 631 tests pass (was 601 — Step 12 adds 30), ruff clean, 116 files formatted
+- `avs models status` proven against all three states: empty registry (exit 0),
+  correctly pinned (exit 0), swapped file (exit 1, digest mismatch named)
+- The reverse AI boundary is asserted by AST inspection, not by convention
+
+---
+
+## Step 13 — Document Type Classifier  ·  17 August 2026
+
+The first AI component whose output travels alongside a verdict. Everything
+before it was upstream of the decision or outside the service entirely, so this
+is where the AI boundary had to stop being module layout and start being runtime
+behaviour.
+
+### The problem it solves
+
+Someone uploads a payslip, a PAN card, or an accidental photo of the floor. The
+QR is not found, so they are told:
+
+> "We could not read the QR code. Please photograph both sides of your Aadhaar
+> card in good light, holding the card flat and filling the frame."
+
+They retake it in better light. It fails identically. Nothing in that message
+could ever have told them why — it names a cause that is not the cause.
+
+### What was built
+
+| File | |
+|---|---|
+| `src/avs/ai/classify/features.py` | `DocumentFeatures`, `extract_features()` — pure measurement |
+| `src/avs/ai/classify/heuristic.py` | `HeuristicClassifier` — works today, no model |
+| `src/avs/ai/classify/onnx.py` | `OnnxDocumentClassifier` — the seam for real weights |
+| `src/avs/ai/classify/__init__.py` | `build_classifier()` — prefers model, falls back |
+| `src/avs/pipeline.py` | optional `classifier=`, message refinement only |
+| `src/avs/cli.py` | `avs classify` |
+| `scripts/collect_classifier_features.py` | corpus measurement, numbers only |
+| `tests/unit/test_classify.py` | 22 tests |
+| `tests/unit/test_classify_never_changes_verdict.py` | 20 tests |
+
+### ★ The measurement that set the design
+
+The obvious heuristic is "documents are dense with edges — text, rules, borders
+— so high edge density means a document". Measured::
+
+    card with QR       0.052
+    card without QR    0.042
+    handwritten page   0.035
+    ─────────────────────────
+    random noise       0.104   ← 2x the card
+    brick wall         0.104   ← 2x the card
+
+**A brick wall is twice as "document-like" as an Aadhaar card on the obvious
+feature.** High edge density means nothing; any textured scene satisfies it.
+
+So only the low end is asserted — near-zero edges, no document quad and no QR
+means no document — and everything else answers UNKNOWN. That is a much smaller
+claim than "document classifier", and it is the claim the measurement supports
+(D127).
+
+### Why it cannot change a verdict
+
+Three independent reasons, any one sufficient:
+
+1. It runs *after* `rules.decide()` has returned. The verdict already exists.
+2. It writes only `user_message` and `ai_trace`. It never receives `verdict`,
+   `proof`, `checks` or `error`.
+3. It returns early on anything but UNREADABLE — **a VERIFIED document is never
+   classified at all**, so no output exists that would have to be ignored.
+
+`test_classify_never_changes_verdict.py` feeds the pipeline a classifier that
+returns every `DocType` at confidence 1.0 and asserts verdict, proof, error and
+the full check list are identical to the no-classifier run. A component that
+lies about everything with total certainty still cannot move the outcome.
+
+### Found while building
+
+Wiring refinement revealed the pipeline would have **ingested every image
+twice** — once to decode, once to classify. Worse, the second ingest could fail
+independently, losing the refinement for no reason. `_SideResult` now carries
+the already-ingested `ValidatedImage` (in memory, for the life of one call;
+`test_statelessness.py` still fails the build if bytes reach disk).
+
+### ★★ CORRECTED BY REAL DATA, SAME DAY
+
+Ran the collector against the 22-image corpus. It contradicted the design::
+
+    phone-a-dim   4 images   0.0000 / 0.0019 / 0.0096   ← REAL CARDS
+
+Three genuine Aadhaar cards sat **at or below** `EDGE_DENSITY_FLOOR = 0.005`.
+Underexposure destroys edge structure, so a dim card and a blank wall are
+identical on that feature — the classes overlap completely at the low end, which
+is the reverse of what the generated data showed. They survived only because the
+QR/quad check happened to fire first.
+
+**And my own safety check hid it.** The script filtered documents with
+`"aadhaar" in label`; the real folders are `phone-a-dim`, `scanner`, so it
+matched zero rows, compared against an empty set, and printed ✓.
+
+Both fixed (D132, D133): `NOT_A_DOCUMENT` now requires adequate exposure, and
+the collector treats everything as a document unless a folder says otherwise.
+
+### Verification
+
+- **680 tests pass** (was 631 — Step 13 adds 49), ruff clean, 122 files formatted
+- `avs classify` proven on generated inputs
+- Contract 1.9.0, code and document consistent (the D125 check holds)
+
+### ★★★ THE HEURISTIC WAS MEASURED AND RETIRED — same day
+
+19 real wrong-upload images were added to the corpus. The heuristic caught
+**0 of them**::
+
+                   edge density        brightness
+    DOCUMENTS   0.0000 - 0.1232      41.0 - 174.6
+    NEGATIVES   0.0031 - 0.0886       3.7 - 235.2
+
+The negative range is *entirely inside* the document range on edge density —
+100% overlap. No threshold separates the classes, so this is not a tuning
+problem. A screenshot of text IS a document image; distinguishing an Aadhaar
+from it needs CONTENT understanding, which shape statistics cannot provide.
+
+`build_classifier()` now defaults to `allow_heuristic=False`, so the heuristic
+no longer runs for employees. It is kept, not deleted: it is the reference
+implementation of the Protocol that Step 14 will follow, the collector scores it
+so the decision can be revisited, and its tests record what was tried (D135).
+
+**What Step 13 therefore delivered** is not a working classifier. It is the
+seam for one — feature extraction, the ONNX adapter, pipeline wiring, and the
+runtime proof that no classifier output can move a verdict — plus the
+measurement infrastructure that proved the interim version does not work.
+Learning that from real data now is worth more than shipping something that
+quietly did nothing.

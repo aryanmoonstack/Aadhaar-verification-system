@@ -20,11 +20,29 @@ import {
 } from '../captureQuality';
 
 describe('measured thresholds', () => {
-  it('★ rejects the resolution that failed 8 out of 8 in the real corpus', () => {
-    // 1920x1200 = 2.3 MP. Every image at this size failed to decode.
+  it('⛔ no longer rejects 2.3 MP — the claim it encoded stopped being true', () => {
+    // ★ EXPECTATION REVERSED BY MEASUREMENT, Step 14.
+    //
+    // This asserted that 1920x1200 (2.3 MP) must be REFUSED, on the grounds
+    // that "every image at this size failed to decode". True of the 22-image
+    // corpus when it was written.
+    //
+    // The corpus grew to 27 documents and the weakest capture that ACTUALLY
+    // DECODED now measures 2.31 MP. So the old rule warned about a photo the
+    // server reads perfectly well — a false alarm, which is exactly what the
+    // pre-upload thresholds exist to avoid.
+    //
+    // The threshold is now generated from the server, so this cannot drift
+    // again without a failing test.
     const result = assess({ width: 1920, height: 1200, qrPixels: 400 });
 
-    expect(result.usable).toBe(false);
+    expect(result.issues).not.toContain('RESOLUTION_TOO_LOW');
+  });
+
+  it('still rejects a genuinely tiny capture', () => {
+    // 640x480 = 0.3 MP, far below anything that has ever decoded.
+    const result = assess({ width: 640, height: 480, qrPixels: 120 });
+
     expect(result.issues).toContain('RESOLUTION_TOO_LOW');
   });
 
@@ -72,11 +90,23 @@ describe('arithmetic', () => {
     expect(megapixels(1920, 1200)).toBeCloseTo(2.3, 1);
   });
 
-  it('thresholds are ordered and the minimum is above the failing resolution', () => {
+  it('thresholds are ordered, and the minimum sits BELOW the weakest success', () => {
     expect(PX_PER_MODULE.unrecoverable).toBeLessThan(PX_PER_MODULE.marginal);
     expect(PX_PER_MODULE.marginal).toBeLessThan(PX_PER_MODULE.good);
-    expect(MIN_MEGAPIXELS).toBeGreaterThan(2.3);
-    expect(MIN_SHARPNESS).toBeGreaterThan(15);
+
+    // ⛔ BELOW, not above. The weakest capture that actually decoded measured
+    //    2.31 MP; a floor above that would refuse a working photo. Was
+    //    `toBeGreaterThan(2.3)` — the exact inversion that caused the drift.
+    expect(MIN_MEGAPIXELS).toBeLessThan(2.31);
+  });
+
+  it('⛔ the generated values match the server', () => {
+    // The single source of truth is `src/avs/ai/quality/assessor.py`, exported
+    // by `python scripts/export_thresholds.py`. Hand-editing either side
+    // recreates the drift this replaced.
+    expect(MODULES_ACROSS).toBe(97);
+    expect(PX_PER_MODULE.unrecoverable).toBe(2.0);
+    expect(MIN_MEGAPIXELS).toBe(2.0);
   });
 });
 

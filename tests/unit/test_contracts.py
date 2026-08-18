@@ -158,5 +158,33 @@ class TestDocTypeContract:
         assert not DocType.UNKNOWN.is_aadhaar
 
 
-def test_contract_version_is_pinned() -> None:
-    assert CONTRACT_VERSION == "1.3.0"
+def test_contract_version_matches_the_document() -> None:
+    """⛔ The code constant must equal the version in CONTRACTS.md.
+
+    This previously pinned the literal "1.3.0", which meant the assertion held
+    happily while the document advanced to 1.7.0 — four steps of drift, and
+    `avs version` reporting a contract version that had not existed for weeks.
+    A test that pins a literal only proves the literal has not changed.
+
+    Reading the document makes the two impossible to separate: bumping one
+    without the other now fails here.
+    """
+    import re
+    from pathlib import Path
+
+    document = Path(__file__).resolve().parents[2] / "CONTRACTS.md"
+    match = re.search(r"^\*\*Version:\*\* (\S+)", document.read_text(encoding="utf-8"), re.M)
+
+    assert match, "CONTRACTS.md has no '**Version:** X.Y.Z' header"
+    assert match.group(1) == CONTRACT_VERSION, (
+        f"CONTRACT_VERSION is {CONTRACT_VERSION} but CONTRACTS.md says "
+        f"{match.group(1)}. Bump src/avs/contracts/__init__.py and src/avs/__init__.py."
+    )
+
+
+def test_the_two_version_constants_agree() -> None:
+    """`avs.__contract_version__` is what the CLI prints; `CONTRACT_VERSION` is
+    what the code imports. They are two names for one fact."""
+    from avs import __contract_version__
+
+    assert __contract_version__ == CONTRACT_VERSION

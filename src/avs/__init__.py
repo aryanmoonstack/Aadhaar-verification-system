@@ -17,6 +17,6 @@ See CONTRACTS.md for the frozen interfaces and PROJECT_STATE.md for build status
 """
 
 __version__ = "0.1.0"
-__contract_version__ = "1.3.0"
+__contract_version__ = "1.9.0"
 
 __all__ = ["__contract_version__", "__version__"]

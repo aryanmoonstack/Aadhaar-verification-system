@@ -49,11 +49,18 @@ from avs.contracts import (
     CheckName,
     CheckOutcome,
     CheckResult,
+    DocType,
+    DocTypePrediction,
+    DocumentClassifier,
     ErrorCode,
     ExpectedIdentity,
     QrPayload,
+    QualityAssessor,
+    QualityScores,
     SignatureProof,
     Strictness,
+    ValidatedImage,
+    Verdict,
     VerificationResult,
 )
 from avs.crypto import SecureQrVerifier
@@ -88,6 +95,162 @@ class _SideResult:
     outcome: CardSideOutcome
     payload_text: str | None
 
+    image: ValidatedImage | None = None
+    """The ingested image, carried so Step 13 can classify without ingesting a
+    second time.
+
+    ⚠ Ingest is not free — it sniffs the format, decodes, normalises and may run
+      a virus scan. Doing all of that twice for a cosmetic message would be
+      wasteful, and re-ingesting could also FAIL the second time under memory
+      pressure, losing the refinement for no reason.
+
+    ⛔ In-memory only, for the life of one `verify()` call. It is never written
+       anywhere — `tests/unit/test_statelessness.py` fails the build if image
+       bytes reach disk."""
+
+    quality: QualityScores | None = None
+    """Step 14 scores, computed once during processing and reused for the
+    message. Measuring twice would double the cost for an identical answer."""
+
+    quality_problems: tuple[str, ...] = ()
+    """Which named problems the assessor found — 'blurry', 'too_dark', and so
+    on. Captured at assessment time so the failure message needs no second pass
+    over the pixels."""
+
+
+#: How sure the classifier must be before its wording is used at all.
+#:
+#: ⚠ High on purpose. The only thing at stake is which sentence an employee
+#:   reads after a failure they are already having, so a confidently wrong
+#:   instruction is worse than the generic one — it sends them off to fix the
+#:   wrong problem, and unlike the generic message it sounds authoritative.
+MIN_REFINEMENT_CONFIDENCE = 0.75
+
+#: ⛔ The word "fake" appears nowhere here and must never appear in any
+#:    employee-facing string. A genuine card photographed badly is
+#:    indistinguishable from a forgery to any automated check — which is exactly
+#:    why no automated check may call it one. CONTRACTS.md §1.
+_NOT_A_DOCUMENT_MESSAGE = (
+    "These photos do not appear to show a document. Please upload clear photos "
+    "of the front and back of your Aadhaar card."
+)
+
+_OTHER_ID_MESSAGE = (
+    "This looks like a different document. Please upload photos of the front "
+    "and back of your Aadhaar card."
+)
+
+
+def _message_for_prediction(predictions: list[DocTypePrediction]) -> str | None:
+    """The replacement message, or None to keep the deterministic one.
+
+    ⚠ Requires unanimity. One clear photo of a card plus one photo of a thumb is
+      a capture problem, and "retake in good light" is then the right advice.
+      Saying "this is not a document" there would be both wrong and insulting.
+    """
+    if not predictions:
+        return None
+
+    confident = [p for p in predictions if p.confidence >= MIN_REFINEMENT_CONFIDENCE]
+    if len(confident) != len(predictions):
+        return None
+
+    kinds = {p.doc_type for p in confident}
+    if kinds == {DocType.NOT_A_DOCUMENT}:
+        return _NOT_A_DOCUMENT_MESSAGE
+    if kinds == {DocType.OTHER_ID}:
+        return _OTHER_ID_MESSAGE
+
+    # Mixed, UNKNOWN, or an Aadhaar class — the classifier agrees it is a card,
+    # so the capture advice already in place is the correct advice.
+    return None
+
+
+def _advisor_name(advisor: object) -> str:
+    """The name recorded in `AiTrace`.
+
+    ⚠ Was `_classifier_name`, which returned "NoneType" when no classifier was
+      configured — and none is, by default, since the classifier was retired in
+      D135. "Which model produced this?" is the first question asked when a
+      result looks wrong, and "NoneType" cannot answer it.
+    """
+    return str(getattr(advisor, "name", type(advisor).__name__))
+
+
+#: Step 14 problem code -> what the employee is told.
+#:
+#: ⛔ ORDERED BY MEASURED COVERAGE, not by intuition. Across 27 real captures run
+#:    through the actual decoder: sharpness explains 68% of failures, brightness
+#:    a further 11% (79% combined), and QR size adds ZERO on top of those. The
+#:    first matching entry wins, so the most useful advice is given first.
+#:
+#: ⛔ The word "fake" appears nowhere and must never appear. A genuine card
+#:    photographed badly is indistinguishable from a forgery to any automated
+#:    check — which is exactly why no automated check may call it one.
+#:    CONTRACTS.md §1.
+_QUALITY_MESSAGES: tuple[tuple[str, str], ...] = (
+    (
+        "blurry",
+        "The photo is too blurry to read the code. Rest the card on a table, "
+        "hold the phone steady, and tap the screen to focus before taking it.",
+    ),
+    (
+        "too_dark",
+        "The photo is too dark to read the code. Please retake it somewhere "
+        "brighter — near a window works well, but avoid direct sunlight.",
+    ),
+    (
+        "code_too_small",
+        "The code on the card is too small to read. Please move closer so the "
+        "card fills most of the frame.",
+    ),
+    (
+        "code_at_edge",
+        "Part of the code is cut off at the edge of the photo. Please retake it "
+        "with the whole card inside the frame.",
+    ),
+    (
+        "no_code_visible",
+        "We could not find the code on either photo. Please make sure you are "
+        "photographing your Aadhaar card, with the whole card in the frame.",
+    ),
+)
+
+
+def _message_for_quality(problems: list[list[str]]) -> str | None:
+    """The replacement message, or None to keep the deterministic one.
+
+    ⚠ Requires the problem to be present on EVERY side that was assessed. One
+      clear photo and one blurry one is a single-photo problem; telling the
+      person "the photo is too blurry" when one of them was fine sends them to
+      retake both, and is wrong about the good one.
+    """
+    if not problems or any(not found for found in problems):
+        return None
+
+    shared = [code for code, _ in _QUALITY_MESSAGES if all(code in f for f in problems)]
+    if not shared:
+        return None
+
+    # ⛔ DARKNESS OUTRANKS BLUR WHEN BOTH FIRE — measured, not assumed.
+    #
+    #    Laplacian variance scales with CONTRAST, so a perfectly focused photo
+    #    taken in the dark measures as blurry. Measured on one image at
+    #    decreasing exposure, focus untouched throughout::
+    #
+    #        brightness x1.00  ->  sharpness 1315
+    #        brightness x0.35  ->  sharpness  155
+    #        brightness x0.12  ->  sharpness   22
+    #
+    #    So darkness CAUSES the low sharpness reading. Saying "hold steadier"
+    #    to someone whose real problem is a dim room sends them to fix the wrong
+    #    thing, and they will fail again identically. More light fixes both.
+    if "too_dark" in shared and "blurry" in shared:
+        shared.remove("blurry")
+
+    first = shared[0]
+    return next(message for code, message in _QUALITY_MESSAGES if code == first)
+
 
 class DocumentVerifier:
     """Verifies an Aadhaar document from its two card faces."""
@@ -101,6 +264,8 @@ class DocumentVerifier:
         generator: PreprocessingVariantGenerator | None = None,
         cascade: QrDecoderCascade | None = None,
         parser: SecureQrParser | None = None,
+        classifier: DocumentClassifier | None = None,
+        quality: QualityAssessor | None = None,
         strictness: Strictness = Strictness.STANDARD,
         time_budget_seconds: float = 12.0,
     ) -> None:
@@ -128,6 +293,24 @@ class DocumentVerifier:
         self.rules = DeterministicVerdictEngine(strictness=strictness)
         self.strictness = strictness
         self.time_budget_seconds = time_budget_seconds
+
+        #: Step 13. OPTIONAL — defaults to None and the pipeline is complete
+        #: without it. ⛔ Consulted ONLY after the deterministic path has already
+        #: failed, and only ever to reword the message. See `_refine_message`.
+        self.classifier = classifier
+
+        #: Step 14. OPTIONAL. Does exactly two things, both safe by construction:
+        #:
+        #:   1. REORDERS the preprocessing variants so the likeliest runs first.
+        #:      ⛔ Never removes one — `select_strategies` returns the full
+        #:         matrix regardless, so this cannot cause a failure that would
+        #:         not otherwise have happened (D141).
+        #:   2. Names WHAT is wrong after a failure, so "we could not read the QR
+        #:      code" becomes "the photo is too blurry".
+        #:
+        #: Measured on 27 real captures: sharpness + brightness explain 79% of
+        #: failures with zero false alarms.
+        self.quality = quality
 
     # ------------------------------------------------------------------ #
 
@@ -164,7 +347,124 @@ class DocumentVerifier:
                 "processing_ms": int((time.perf_counter() - started) * 1000),
             }
         )
+
+        # ⛔ Step 13. Runs LAST, on a verdict that is already final. It may
+        #    return a result whose `user_message` differs; it may never return
+        #    one whose `verdict` differs — enforced by `_refine_message` and
+        #    asserted for every possible prediction in
+        #    tests/unit/test_classify_never_changes_verdict.py.
+        result = self._refine_message(result, results)
+
         return self.privacy.apply(result)
+
+    # ------------------------------------------------------------------ #
+    # Step 13 — message refinement. NOT a decision.
+    # ------------------------------------------------------------------ #
+
+    def _refine_message(
+        self, result: VerificationResult, results: list[_SideResult]
+    ) -> VerificationResult:
+        """Say something true when the standard message would mislead.
+
+        THE PROBLEM THIS SOLVES
+        -----------------------
+        Someone uploads a payslip, a PAN card, or an accidental photo of the
+        floor. The QR is not found, so the verdict is UNREADABLE and they are
+        told::
+
+            "We could not read the QR code. Please photograph both sides of
+             your Aadhaar card in good light..."
+
+        They retake it in better light. It fails again, identically, and nothing
+        in the message could ever have told them why. The instruction does not
+        merely fail to help — it names a cause that is not the cause.
+
+        ⛔ WHY THIS CANNOT AFFECT A VERDICT
+
+        Three independent reasons, any one of which would be sufficient:
+
+        1. It runs after ``rules.decide()`` has returned. The verdict exists
+           before this method is called.
+        2. It only ever writes ``user_message`` and ``ai_trace`` — never
+           ``verdict``, ``proof``, ``checks`` or ``error``.
+        3. It returns early on anything other than UNREADABLE. A VERIFIED
+           document is never even classified, so no model output can exist that
+           would have to be ignored.
+
+        ⚠ Deliberately conservative: EVERY side must independently look like a
+          non-document. One good photo of a card and one photo of a thumb is a
+          capture problem, not a wrong-document problem, and the two need
+          opposite advice.
+        """
+        # ⛔ Either advisor is enough. This used to read `if self.classifier is
+        #    None`, written when the classifier was the only advisor. Step 14
+        #    added quality, and with no classifier configured — which is now the
+        #    DEFAULT, since the classifier was retired in D135 — that guard
+        #    returned before quality ever ran, so the measured component was
+        #    silently dead in the normal configuration.
+        if (self.classifier is None and self.quality is None) or not results:
+            return result
+
+        # Only UNREADABLE. TAMPERED means a QR decoded and parsed — the document
+        # IS an Aadhaar and classification adds nothing. ERROR is our fault, not
+        # the employee's, and VERIFIED needs no help.
+        if result.verdict is not Verdict.UNREADABLE:
+            return result
+
+        started = time.perf_counter()
+        predictions: list[DocTypePrediction] = []
+        degraded: list[str] = []
+
+        for side_result in results if self.classifier is not None else []:
+            if side_result.image is None:
+                # Ingest failed for this side. There is nothing to look at, and
+                # the FILE_VALIDATION message already says something true.
+                continue
+            try:
+                predictions.append(self.classifier.classify(side_result.image))
+            except BaseException as exc:
+                # ⛔ Broad by design. This is cosmetic work running after a
+                #    verdict is settled; it must never be the reason a result
+                #    fails to reach the employee (D120).
+                degraded.append(type(exc).__name__)
+
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+
+        # ⛔ QUALITY FIRST — it is the measured component.
+        #
+        #    Step 14's thresholds come from 27 real captures paired with actual
+        #    decode outcomes: 79% of failures explained, zero false alarms. The
+        #    Step 13 classifier caught 0 of 19 real wrong-uploads and is retired
+        #    (D135), so when both have something to say, quality wins.
+        quality_message = _message_for_quality(
+            [list(side.quality_problems) for side in results if side.image is not None]
+        )
+
+        if not predictions and quality_message is None:
+            return result
+
+        used = [
+            _advisor_name(advisor)
+            for advisor in (self.quality, self.classifier)
+            if advisor is not None
+        ]
+        trace = result.ai_trace.model_copy(
+            update={
+                "models_used": [*result.ai_trace.models_used, *used],
+                "total_ai_ms": result.ai_trace.total_ai_ms + elapsed_ms,
+                "degraded": [*result.ai_trace.degraded, *degraded],
+            }
+        )
+
+        # Quality outranks classification — see the note above.
+        message = quality_message or _message_for_prediction(predictions)
+        update: dict[str, object] = {"ai_trace": trace}
+        if message is not None:
+            update["user_message"] = message
+
+        # ⛔ `update` contains only `ai_trace` and possibly `user_message`.
+        #    Nothing else can be reached from here.
+        return result.model_copy(update=update)
 
     # ------------------------------------------------------------------ #
     # Per-side processing — Steps 3, 4, 5 in sequence
@@ -191,6 +491,37 @@ class DocumentVerifier:
             results.append(self._process_side(side, time.perf_counter() + share))
         return results
 
+    def _assess(self, image: ValidatedImage) -> tuple[QualityScores | None, tuple[str, ...]]:
+        """Score a capture once, returning the scores and the named problems.
+
+        Both come from a single pass: the scores reorder the variant matrix, the
+        problem names supply the failure message. Splitting them across two calls
+        would measure identical pixels twice.
+
+        ⛔ Never raises. An advisory component that can throw is a dependency
+           with extra steps (D120); a failed assessment simply means the
+           deterministic variant order stands and the generic message is used.
+        """
+        if self.quality is None:
+            return None, ()
+
+        # ⚠ `assess_detailed` is an OPTIONAL enrichment, not part of the
+        #   `QualityAssessor` Protocol. A third-party assessor implementing only
+        #   `assess()` still reorders the variants correctly; it just cannot name
+        #   the problem, and the deterministic message stands.
+        detailed = getattr(self.quality, "assess_detailed", None)
+        if callable(detailed):
+            try:
+                scores, problems = detailed(image)
+                return scores, tuple(problems)
+            except BaseException:
+                return None, ()
+
+        try:
+            return self.quality.assess(image), ()
+        except BaseException:
+            return None, ()
+
     def _process_side(self, side: SideInput, deadline: float) -> _SideResult:
         started = time.perf_counter()
 
@@ -216,7 +547,16 @@ class DocumentVerifier:
             max_variants=self.cascade.max_variants,
             time_budget_seconds=remaining,
         )
-        decoded = bounded.decode(self.generator.generate(image))
+
+        # ⛔ Step 14. Scores REORDER the variant matrix; they never shrink it —
+        #    `select_strategies` returns every strategy regardless (D141). So a
+        #    wrong assessment costs some wasted ordering, never a lost decode.
+        #
+        # ⚠ Assessed once and carried on the result. The same numbers name the
+        #   problem in the failure message later; measuring twice would double
+        #   the cost for an identical answer.
+        scores, problems = self._assess(image)
+        decoded = bounded.decode(self.generator.generate(image, quality=scores))
         elapsed = int((time.perf_counter() - started) * 1000)
 
         kind = classify_payload(decoded.raw_payload) if decoded.raw_payload else None
@@ -235,6 +575,9 @@ class DocumentVerifier:
                 processing_ms=elapsed,
             ),
             decoded.raw_payload,
+            image=image,
+            quality=scores,
+            quality_problems=problems,
         )
 
     # ------------------------------------------------------------------ #

@@ -266,9 +266,21 @@ class TestStrategySelection:
     def test_limit_caps_the_count(self) -> None:
         assert len(select_strategies(None, limit=5)) == 5
 
-    def test_quality_narrows_the_set(self) -> None:
-        """★ The Step 14 payoff: a sharp, well-lit but low-contrast image should
-        not pay for eight illumination and perspective strategies.
+    def test_quality_reorders_without_narrowing(self) -> None:
+        """⛔ EXPECTATION REVERSED BY MEASUREMENT — 17 Aug 2026.
+
+        This used to assert `len(narrowed) < len(STRATEGIES)` — that a quality
+        model should SHRINK the matrix. Step 14 measured what that actually did:
+        when quality reported "this photo looks fine", 23 strategies became 3,
+        discarding `gray+adaptive` — the only strategy that rescued a heavily
+        blurred card the original failed on.
+
+        Four real corpus images are sharp, bright and well-sized yet still
+        undecodable, and those are exactly the inputs for which quality reports
+        no problem. Shrinking would have removed their best remaining chance.
+
+        The payoff is REORDERING: the likeliest strategy runs sooner, and
+        nothing is taken away. See D141.
         """
         good = QualityScores(
             blur=0.95,
@@ -279,9 +291,10 @@ class TestStrategySelection:
             shadow=0.95,
             decodability=0.9,
         )
-        narrowed = select_strategies(good)
-        assert len(narrowed) < len(STRATEGIES)
-        assert any(s.tier == 0 for s in narrowed), "tier 0 must always survive"
+        selected = select_strategies(good)
+
+        assert {s.name for s in selected} == {s.name for s in select_strategies(None)}
+        assert selected[0].tier == 0, "the cheapest tier must still run first"
 
     def test_blurry_image_keeps_blur_strategies(self) -> None:
         blurry = QualityScores(
@@ -430,9 +443,16 @@ class TestRegionSeam:
 
 
 class TestQualitySeam:
-    """Step 14 seam — narrow the strategy set using model output."""
+    """Step 14 seam — REORDER the strategy set using model output."""
 
-    def test_quality_reduces_variant_count(self, generator, photo) -> None:
+    def test_quality_preserves_the_variant_count(self, generator, photo) -> None:
+        """⛔ Was `assert len(with_model) < len(without_model)`.
+
+        Reversed for the reason in `test_quality_reorders_without_narrowing`:
+        an advisory component that can DELETE a decode attempt can cause a
+        failure that would not otherwise have happened (D120). Quality decides
+        what is tried EARLIER, never what is skipped.
+        """
         good = QualityScores(
             blur=0.95,
             glare=0.95,
@@ -444,7 +464,9 @@ class TestQualitySeam:
         )
         with_model = list(generator.generate(photo, quality=good))
         without_model = list(generator.generate(photo))
-        assert len(with_model) < len(without_model)
+
+        assert len(with_model) == len(without_model)
+        assert {v.strategy for v in with_model} == {v.strategy for v in without_model}
 
     def test_quality_is_optional(self, generator, photo) -> None:
         """The pipeline must run identically before Step 14 exists."""
@@ -636,3 +658,208 @@ def test_uncropped_fallback_is_offered_early(builder, monkeypatch):
     # The full-frame retry must be among the first couple of variants.
     sizes = {len(v.data) for v in variants[:2]}
     assert len(sizes) == 2, "the uncropped frame was not offered immediately after the crop"
+
+
+# --------------------------------------------------------------------------- #
+# ⛔ find_qr_region — two bugs found by real corpus measurement, 17 Aug 2026
+# --------------------------------------------------------------------------- #
+
+
+def _encoded_qr():
+    """A genuinely decodable QR — not a random grid, which would look like one
+    to a finder-pattern search while decoding to nothing."""
+    import cv2
+    import numpy as np
+
+    rng = np.random.default_rng(3)
+    payload = "".join(str(int(d)) for d in rng.integers(0, 10, 1200))
+    return cv2.QRCodeEncoder_create().encode(payload)
+
+
+def _card(qr_px: int, *, decoys: bool = False):
+    """A card face: printed text lines, optional QR, optional decoy squares."""
+    import cv2
+    import numpy as np
+
+    rng = np.random.default_rng(3)
+    width, height = 2400, 1500
+    frame = np.full((height + 400, width + 400, 3), 60, np.uint8)
+    face = np.full((height, width, 3), 245, np.uint8)
+
+    for index in range(30):
+        y = 90 + index * 40
+        cv2.line(face, (60, y), (60 + int(rng.integers(400, width - 500)), y), (25, 25, 25), 7)
+
+    if decoys:
+        # Three concentric squares at QR-ish corners — the shape that fooled
+        # the old detector into inventing a region spanning the whole card.
+        for cx, cy in ((300, 300), (1800, 300), (300, 1100)):
+            cv2.rectangle(face, (cx, cy), (cx + 120, cy + 120), (20, 20, 20), -1)
+            cv2.rectangle(face, (cx + 20, cy + 20), (cx + 100, cy + 100), (245, 245, 245), -1)
+
+    if qr_px:
+        qr = cv2.cvtColor(
+            cv2.resize(_encoded_qr(), (qr_px, qr_px), interpolation=cv2.INTER_NEAREST),
+            cv2.COLOR_GRAY2BGR,
+        )
+        face[height - qr_px - 60 : height - 60, width - qr_px - 60 : width - 60] = qr
+
+    frame[200 : 200 + height, 200 : 200 + width] = face
+    return frame
+
+
+def test_located_region_is_always_square():
+    """⛔ THE BUG THAT BROKE EVERY px_per_module MEASUREMENT.
+
+    Run against a real corpus, this function returned a 2788x5417 region —
+    aspect 0.51 — and called it a QR. Five of six such regions were non-square,
+    and none decoded even cropped and upscaled 4x.
+
+    A QR is square. Perspective skews the finder-pattern bounding box, but never
+    to 2:1.
+    """
+    from avs.imaging.ops import find_qr_region, to_grayscale
+
+    for qr_px in (400, 500, 700, 900, 1100):
+        box = find_qr_region(to_grayscale(_card(qr_px)))
+        assert box is not None, f"lost a real {qr_px}px QR"
+        aspect = box[2] / box[3]
+        assert 0.72 <= aspect <= 1.39, f"{qr_px}px QR -> aspect {aspect:.2f}"
+
+
+def test_no_region_is_invented_on_a_card_without_a_qr():
+    """⛔ D136: the old detector reported a QR in 16 of 19 images that have none.
+
+    The decoy squares here are the exact shape that fooled it — three
+    concentric squares roughly at QR corners.
+    """
+    from avs.imaging.ops import find_qr_region, to_grayscale
+
+    assert find_qr_region(to_grayscale(_card(0))) is None
+    assert find_qr_region(to_grayscale(_card(0, decoys=True))) is None
+
+
+def test_the_located_region_is_about_the_size_of_the_real_qr():
+    """★ The old code kept the LARGEST candidate, so a phantom spanning the card
+    always beat the real QR — inflating every corpus measurement roughly 3x.
+
+    Selection is now by finder-pattern size, so the reported box tracks the
+    actual code.
+    """
+    from avs.imaging.ops import find_qr_region, to_grayscale
+
+    for qr_px in (400, 500, 900, 1100):
+        box = find_qr_region(to_grayscale(_card(qr_px)))
+        assert box is not None
+        error = abs(box[2] - qr_px) / qr_px
+        assert error < 0.35, f"{qr_px}px QR reported as {box[2]}px ({error:.0%} out)"
+
+
+def test_finder_geometry_matches_real_qr_proportions():
+    """⛔ The leg check used to be `> 1.5 * marker_width` — about 9x too loose,
+    which is why ordinary card furniture qualified.
+
+    For an N-module code the leg between adjacent finder centres is (N - 7)
+    modules and a marker is 7, so the ratio is (N - 7) / 7. Aadhaar's Secure QR
+    is version 21-22, giving 12.9-13.4.
+    """
+    from avs.imaging.ops import MAX_LEG_TO_MARKER, MIN_LEG_TO_MARKER
+
+    for modules in (97, 101):  # the Aadhaar range
+        ratio = (modules - 7) / 7
+        assert MIN_LEG_TO_MARKER <= ratio <= MAX_LEG_TO_MARKER
+
+    assert MIN_LEG_TO_MARKER > 1.5, "the old, far-too-loose bound must not return"
+
+
+# --------------------------------------------------------------------------- #
+# ⛔ Step 14 — quality REORDERS the variant matrix, it never shrinks it
+# --------------------------------------------------------------------------- #
+
+
+def _scores(**overrides):
+    from avs.contracts import QualityScores
+
+    base = {
+        "blur": 1.0,
+        "glare": 1.0,
+        "skew_degrees": 1.0,
+        "resolution_adequate": True,
+        "crop_complete": True,
+        "shadow": 1.0,
+        "decodability": 0.75,
+        "model_version": "test",
+    }
+    base.update(overrides)
+    return QualityScores(**base)
+
+
+def test_quality_never_removes_a_strategy():
+    """⛔⛔ THE D120 VIOLATION THIS PREVENTS.
+
+    `select_strategies` used to FILTER on the detected problems. Measured: when
+    quality reported "this photo looks fine", 23 strategies were cut to 3 — and
+    among the 20 discarded was `gray+adaptive`, the only strategy that rescued a
+    heavily blurred test card (original failed, adaptive succeeded at attempt 6).
+
+    Four real corpus images are sharp, bright and well-sized yet undecodable —
+    exactly the inputs for which quality reports no problem. Filtering would
+    have stripped their best remaining chance on precisely the images needing it
+    most.
+
+    An advisory component that can DELETE a decode attempt can cause a failure
+    that would not otherwise happen.
+    """
+    from avs.imaging.strategy import select_strategies
+
+    everything = {s.name for s in select_strategies(None)}
+
+    for scores in (
+        _scores(),  # "looks perfect" — the dangerous case
+        _scores(blur=0.05, decodability=0.05),
+        _scores(glare=0.05, decodability=0.05),
+        _scores(resolution_adequate=False, decodability=0.1),
+        _scores(skew_degrees=30.0),
+        _scores(decodability=0.0),
+    ):
+        selected = {s.name for s in select_strategies(scores)}
+        assert selected == everything, f"quality removed {everything - selected}"
+
+
+def test_quality_actually_changes_the_order():
+    """★ Reordering that reorders nothing is decoration.
+
+    An earlier version marked EVERY problem as detected whenever decodability
+    was low, which made every strategy equally relevant and produced an ordering
+    byte-identical to having no quality model. This asserts the signal survives.
+    """
+    from avs.imaging.strategy import select_strategies
+
+    base = [s.name for s in select_strategies(None)]
+    blurry = [s.name for s in select_strategies(_scores(blur=0.1, decodability=0.2))]
+    glary = [s.name for s in select_strategies(_scores(glare=0.1, decodability=0.2))]
+
+    assert blurry != base, "blur produced the deterministic order unchanged"
+    assert glary != base, "glare produced the deterministic order unchanged"
+    assert blurry != glary, "different problems must produce different orders"
+
+
+def test_the_original_is_always_tried_first():
+    """⛔ Every one of the 8 real corpus successes decoded on `original`.
+
+    No quality signal may push it back — that would add work to every
+    successful upload.
+    """
+    from avs.imaging.strategy import select_strategies
+
+    for scores in (None, _scores(), _scores(blur=0.01, glare=0.01, decodability=0.01)):
+        assert select_strategies(scores)[0].name == "original"
+
+
+def test_cheap_tiers_still_come_before_expensive_ones():
+    """⚠ Tier stays the primary sort key. A heuristic finding an expensive
+    strategy 'apt' must not delay a cheap one that might simply work."""
+    from avs.imaging.strategy import select_strategies
+
+    tiers = [s.tier for s in select_strategies(_scores(blur=0.1, decodability=0.1))]
+    assert tiers == sorted(tiers)
