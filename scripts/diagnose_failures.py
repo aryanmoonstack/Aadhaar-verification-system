@@ -125,8 +125,25 @@ def main() -> int:
     )
     arguments = parser.parse_args()
 
+    # ⛔ Placeholder first — "Not a directory" is technically true and useless
+    #    when the argument was never a path to begin with.
+    text = str(arguments.folder)
+    if any(token in text for token in ("path\\to", "path/to", "<", ">", "your-")):
+        print(f"⛔ That is the example path, not a real one: {text}\n")
+        print("   Point at the FOLDER holding the images, e.g.")
+        print("     python scripts/diagnose_failures.py C:\\aadhaar-corpus\\phone-a-dim")
+        return 2
+
+    if arguments.folder.is_file():
+        # A single file is a reasonable thing to pass; use its folder and it
+        # will be picked up along with its siblings.
+        print(f"⛔ That is a file, not a folder: {arguments.folder.name}\n")
+        print("   Point at the folder containing it:")
+        print(f"     python scripts/diagnose_failures.py {arguments.folder.parent}")
+        return 2
+
     if not arguments.folder.is_dir():
-        print(f"Not a directory: {arguments.folder}")
+        print(f"⛔ No such folder: {arguments.folder}")
         return 2
 
     import cv2
