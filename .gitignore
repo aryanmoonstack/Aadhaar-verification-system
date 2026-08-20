@@ -117,6 +117,8 @@ test-images/
 audit.jsonl
 *.audit.jsonl
 local_e2e_audit.jsonl
+mock_hrm_audit.jsonl
+test_page_audit.jsonl
 
 
 # AI model weights — Step 12. A model file is tens to hundreds of megabytes and

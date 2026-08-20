@@ -1,4 +1,13 @@
--- Aadhaar verification records — Step 10, PostgreSQL.
+-- Aadhaar verification records — PostgreSQL.
+--
+-- ⚠ Moved here from `integration/spring/` when the Spring client was dropped
+--   (20 Aug 2026). The Java code became dead when the Next.js route started
+--   calling AVS directly — but this file did not. It encodes two constraints
+--   (D113) that nothing else in the system enforces, and they apply whichever
+--   language writes the rows.
+--
+--   Applied with whatever your HRM already uses — Flyway, Liquibase, or by
+--   hand. It is plain PostgreSQL and depends on nothing.
 --
 -- ⛔ THIS TABLE IS PERMANENT AND CONTAINS IDENTITY DATA.
 --
@@ -6,6 +15,20 @@
 --    the HRM. So every column here is a column that exists forever, and the
 --    schema is the last line of defence against storing something that should
 --    never have been stored.
+--
+-- ⚠ WHAT IS WRITTEN TODAY, AND WHY THE SCHEMA IS WIDER THAN THAT
+--
+--    Only APPROVED verifications are inserted right now — a real card, signed,
+--    signature checked. Everything else shows the employee a re-upload message
+--    and is not stored, which keeps failed attempts (and their identity data)
+--    out of the database entirely.
+--
+--    The review columns below are unused for now on purpose. `PROFILE_MISMATCH`
+--    needs expected identity passed at submit time, `TEXT_MISMATCH` needs OCR
+--    (Step 17) and `DUPLICATE` needs Step 18 — none are reachable yet. When
+--    they are, those rows need somewhere to land, and a schema change at that
+--    point would be a migration against live identity data. Leaving the columns
+--    here now costs nothing and avoids that.
 --
 -- ⛔ THERE IS NO COLUMN FOR A FULL AADHAAR NUMBER, AND THERE MUST NEVER BE.
 --

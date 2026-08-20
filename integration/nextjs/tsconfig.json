@@ -10,7 +10,11 @@
     "skipLibCheck": true,
     "jsx": "preserve",
     "esModuleInterop": true,
-    "types": ["node"]
+    "types": ["node"],
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./*"]
+    }
   },
   "include": ["lib/**/*.ts", "components/**/*.tsx", "app/**/*.ts"],
   "exclude": ["node_modules"]

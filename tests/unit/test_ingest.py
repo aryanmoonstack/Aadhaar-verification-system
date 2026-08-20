@@ -58,10 +58,22 @@ class TestMagicDetection:
     def test_accepted_formats_are_identified(self, fmt: str, expected: FileKind) -> None:
         assert detect(make_image_bytes(fmt=fmt)).kind is expected
 
+    def test_pdf_is_detected_and_accepted_but_is_not_an_image(self) -> None:
+        """PDF sits alone: accepted as input, still not something Pillow can open.
+
+        ⚠ The two properties must not be conflated. ``is_accepted`` lets the
+          bytes past the allow-list; ``is_image`` is what stops them reaching
+          ``Image.open``, which cannot open a PDF and would report a valid
+          document as a corrupt photo.
+        """
+        detected = detect(FAKE_HEADERS["pdf"])
+        assert detected.kind is FileKind.PDF
+        assert detected.is_accepted is True
+        assert detected.kind.is_image is False
+
     @pytest.mark.parametrize(
         ("name", "expected"),
         [
-            ("pdf", FileKind.PDF),
             ("zip", FileKind.ZIP),
             ("gzip", FileKind.ZIP),
             ("elf", FileKind.EXECUTABLE),
@@ -147,20 +159,27 @@ class TestAcceptedUploads:
 class TestRejectedUploads:
     @pytest.mark.parametrize(
         "name",
-        ["pdf", "zip", "gzip", "elf", "pe", "javaclass", "gif", "bmp", "tiff", "svg", "html"],
+        ["zip", "gzip", "elf", "pe", "javaclass", "gif", "bmp", "tiff", "svg", "html"],
     )
     def test_disallowed_types_are_rejected(self, lenient: ImageIngestor, name: str) -> None:
         with pytest.raises(IngestError) as exc:
             lenient.ingest(FAKE_HEADERS[name])
         assert exc.value.code is ErrorCode.UNSUPPORTED_MIME_TYPE
 
-    def test_pdf_rejection_message_is_actionable(self, lenient: ImageIngestor) -> None:
-        """Your decision was images-only. The employee must be told what to do
-        instead, not just that it failed.
+    def test_damaged_pdf_is_reported_as_damaged_not_as_unsupported(
+        self, lenient: ImageIngestor
+    ) -> None:
+        """★ The error moved, and the move is the point.
+
+        ``FAKE_HEADERS["pdf"]`` is a PDF header with no valid document behind it.
+        It used to fail the allow-list; now it passes the allow-list and fails
+        the renderer. The employee is told the file is damaged and what to do,
+        rather than that PDFs are refused — which is no longer true.
         """
         with pytest.raises(IngestError) as exc:
             lenient.ingest(FAKE_HEADERS["pdf"])
-        assert "PDF" in exc.value.user_message
+        assert exc.value.code is ErrorCode.CORRUPT_IMAGE
+        assert exc.value.code is not ErrorCode.UNSUPPORTED_MIME_TYPE
         assert "photo" in exc.value.user_message.lower()
 
     def test_empty_file(self, lenient: ImageIngestor) -> None:
@@ -223,9 +242,19 @@ class TestExtensionIsNeverTrusted:
             lenient.ingest(FAKE_HEADERS["pe"], filename=filename)
         assert exc.value.code is ErrorCode.UNSUPPORTED_MIME_TYPE
 
-    def test_pdf_renamed_as_jpeg_is_still_rejected(self, lenient: ImageIngestor) -> None:
-        with pytest.raises(IngestError):
+    def test_pdf_renamed_as_jpeg_is_handled_as_a_pdf(self, lenient: ImageIngestor) -> None:
+        """Content still decides. The extension never did and still does not.
+
+        Now that PDF is accepted, the interesting half of this test is that a
+        file named ``.jpg`` is routed to the PDF renderer — not to Pillow —
+        because its bytes say ``%PDF-``.
+        """
+        with pytest.raises(IngestError) as exc:
             lenient.ingest(FAKE_HEADERS["pdf"], filename="aadhaar_card.jpg")
+        # The renderer rejected it, which proves the routing. Pillow would have
+        # produced a different code entirely.
+        assert exc.value.code is ErrorCode.CORRUPT_IMAGE
+        assert "PDF" in exc.value.message
 
     def test_valid_image_with_a_wrong_extension_is_still_accepted(
         self, ingestor: ImageIngestor

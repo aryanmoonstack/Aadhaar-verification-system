@@ -1,7 +1,7 @@
 # CONTRACTS — Frozen Interfaces
 
 **Frozen:** Step 0 · 13 August 2026
-**Version:** 1.9.0
+**Version:** 2.0.0
 
 > ## ⛔ READ BEFORE CHANGING ANYTHING IN THIS FILE
 >
@@ -436,14 +436,52 @@ Headers: `X-AVS-Signature` `X-AVS-Timestamp` `X-AVS-Nonce`.
 
 ## 9. Accepted Input
 
-**Accepted:** JPEG · PNG · HEIC/HEIF · WebP
-**Rejected:** PDF · archives · executables · Office documents · SVG · HTML
+**Accepted:** JPEG · PNG · HEIC/HEIF · WebP · **PDF**
+**Rejected:** archives · executables · Office documents · SVG · HTML
 
 **Limits:** 50 KB – 20 MB · min 640×480 · max 12000×12000
 
-> **PDF is deliberately out of scope** (decision recorded 13 Aug 2026). Input is
-> phone-camera and scanner images only. Do not reintroduce PDF handling in any step
-> without a contract version bump.
+### PDF — admitted in 2.0.0 (19 Aug 2026)
+
+PDF was out of scope from 13 Aug 2026 and refused by name. That decision is
+**reversed**, and this section is the contract bump the old wording required.
+
+**Why it changed.** An e-Aadhaar PDF stores the Secure QR as vector or lossless
+raster data. Rendered at 300 DPI it has no motion blur, glare, perspective or
+JPEG ringing — the four defects that held the measured photo corpus to roughly
+30% decode. PDF is expected to be the *better* input, not a concession.
+
+**How it is handled.** `avs.ingest.pdf` renders pages to PNG at the boundary and
+`validator.py` feeds each page back through the ordinary image path. Nothing
+downstream of ingest knows a PDF was involved, and no existing guard was
+relaxed to make that true.
+
+| Rule | Value |
+|---|---|
+| Render resolution | 300 DPI — 150 puts the QR under the 2.0 px/module decode floor |
+| Pages read | first 4; later pages ignored, not rejected |
+| Per-page pixel ceiling | 40 MP, checked before the bitmap is allocated |
+| `max_pixels_per_byte` | **1000** for rendered pages, vs 150 for photographs |
+| Minimum file size | not applied — a vector QR renders fine from 20 KB |
+| Forms / JavaScript | never executed; the form environment is never initialised |
+| Encrypted PDFs | password accepted, held in memory only, never logged |
+
+> ⛔ **`max_pixels_per_byte` must not be unified back to 150.** Measured at A4 /
+> 300 DPI: a near-blank page is **262 px/byte** and a two-line page is **146**.
+> Valid pages sit astride the photograph limit, so that constant would fire on
+> some real documents and not others — presenting as an intermittent fault
+> rather than a misapplied setting. `tests/unit/test_pdf_ingest.py` pins this.
+
+> ⚠ **The security posture changed and should be read, not assumed.** PDFium is
+> a large C++ parser running over stranger-supplied bytes — a different class of
+> risk from a JPEG decoder. Forms, JavaScript and external references are all
+> disabled, and page count and pixels are capped. Those narrow the surface; they
+> do not remove it. Process isolation for the render is a **deployment**
+> responsibility, recorded in `docs/GO_LIVE.md`.
+
+**New error codes:** `PDF_PASSWORD_REQUIRED`, `PDF_PASSWORD_INCORRECT` (§3).
+Split deliberately — "supply a password" and "correct the one you supplied" need
+opposite actions from the employee, and PDFium reports both as the same code.
 
 ---
 
@@ -460,7 +498,36 @@ Headers: `X-AVS-Signature` `X-AVS-Timestamp` `X-AVS-Nonce`.
 
 ## 11. Two-Sided Capture
 
-**The employee uploads BOTH sides of the Aadhaar card. Both are required.**
+**Two IMAGES are required. One PDF is sufficient on its own.**
+
+### The PDF exception (2.0.0) — why it is not a weakening
+
+The rule below exists to close the forged-front attack, and that attack needs
+the two faces to come from **different sources**. Two separate photographs can.
+The pages of a single PDF cannot — they arrived as one file.
+
+Before this exception, an employee holding one PDF had to submit the *same
+bytes* into both slots. That added no evidence at all, doubled the rendering
+work, and produced a **misleading** check result:
+`SIDE_AGREEMENT = PASS, "both sides carry the same payload"` — two copies of one
+file agreeing with each other, recorded in a way that reads as independent
+corroboration. A single upload reports `SKIP`, which is the truth.
+
+| Submitted | Behaviour |
+|---|---|
+| Two images | Both required. Unchanged. |
+| One PDF | Accepted alone. Its pages are searched for both faces. |
+| One image | **400**, with a message naming the PDF alternative. Never 422. |
+| PDF + image | Accepted — an employee may hold one of each. |
+
+> ⚠ **What this does not fix.** A PDF containing only a QR page and no printed
+> face leaves the Step 17 cross-check nothing to compare. That was equally true
+> when the same file was uploaded twice, so nothing regressed — but it is a real
+> limit, not a solved problem, and Step 17 must not assume a printed face exists.
+
+---
+
+**For images: the employee uploads BOTH sides. Both are required.**
 
 ### Why — the signature does not cover the printed card
 
@@ -514,6 +581,7 @@ them: run the existing pipeline on each side, then produce one
 
 | Version | Date | Change |
 |---|---|---|
+| 2.0.0 | 2026-08-19 | **§9 admits PDF as input; §11 lets one PDF stand alone; §3 gains two PDF error codes.** §11: a lone PDF is accepted because the forged-front attack requires the two faces to come from different sources, which pages of one file cannot; a lone image is still refused, now with 400 and an actionable message rather than a bare 422. This also removes a misleading `SIDE_AGREEMENT = PASS` that fired when identical bytes were submitted twice. **§9 detail:** ⛔ **BREAKING** — §9 previously refused PDF by name and required a version bump to reverse it, which is this entry. Rationale: an e-Aadhaar PDF holds the Secure QR as vector data, so a 300 DPI render carries none of the blur, glare or JPEG ringing that held the measured photo corpus to ~30% decode. Implementation is a converter at the ingest boundary (`avs.ingest.pdf`) — pages are rendered to PNG and rejoin the ordinary image path, so no downstream stage learned about PDFs and no existing guard was relaxed. Two limits are PDF-specific and measured, not assumed: `max_pixels_per_byte` 1000 vs 150 (a near-blank A4 page is 262 px/byte, so the photograph limit rejected valid pages) and no minimum file size. Consumers reviewed: `pipeline/` (must use `ingest_all`, since the QR is often not on page one); `api/` (needs a `password` field); Next.js (`accept` attribute). Spring client unaffected. Security posture changed — see §9. |
 | 1.0.0 | 2026-08-13 | Initial freeze (Step 0) |
 | 1.9.0 | 2026-08-17 | **§6 gains `ai/classify/`; §7 gains the runtime rules for AI output that travels with a verdict (Step 13).** Additive — `DocumentClassifier` was already declared in §6 and is unchanged. The new material is §7's table of what the classifier may and may not write, and the fact that a VERIFIED document is never classified at all. Consumers reviewed: `pipeline/` (gains an optional `classifier=` parameter, default `None`); `api/`, Spring and Next.js unchanged — refinement only alters `user_message`, which they already display verbatim. |
 | 1.8.0 | 2026-08-17 | **§6 gains the model registry and inference runtime; §7's enforcement becomes bidirectional (Step 12).** Additive — no existing interface changes. §6 documents `ai/modelmgr/`, which makes "optional-by-design" a mechanism rather than a convention: one component owns every model failure path, and models are SHA-256-pinned exactly as UIDAI certificates are. §7 now states the reverse boundary — the AI layer may not import the decision layer — plus the type-level guard on `InferenceOutcome`. Consumers reviewed: `ai/` (empty until Step 13, so nothing to migrate); `pipeline/` unchanged. |

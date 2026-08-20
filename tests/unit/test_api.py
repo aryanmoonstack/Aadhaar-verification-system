@@ -220,12 +220,26 @@ def test_explicit_job_id_is_honoured_and_idempotent(
     assert second.json()["already_queued"] is True, "a retry must be reported as a duplicate"
 
 
-def test_missing_back_side_is_rejected(client: TestClient, card_with_qr):
-    """Both faces are required — CONTRACTS.md §11."""
+def test_a_lone_image_is_still_rejected(client: TestClient, card_with_qr):
+    """Both faces are required for IMAGES — CONTRACTS.md §11.
+
+    ⚠ 400, not 422. It used to be 422 because ``back`` was a required field and
+      FastAPI answered "field required" before any handler ran. Now the rule is
+      explicit, so the response can say what to do instead — including that a
+      PDF may be uploaded on its own.
+
+      Two photographs can come from two different cards, which is the forged-
+      front attack §11 exists to close. That reasoning is unchanged.
+    """
     response = client.post(
         "/v1/verify/upload", files={"front": ("front.jpg", card_with_qr, "image/jpeg")}
     )
-    assert response.status_code == 422
+    assert response.status_code == 400
+
+    detail = response.json()["detail"]
+    assert detail["retryable"] is True
+    assert "PDF" in detail["user_message"]
+    assert "fake" not in detail["user_message"].lower()
 
 
 def test_unknown_job_is_404(client: TestClient):

@@ -390,7 +390,15 @@ class TestBudgetFairness:
 
 class TestErrorCodes:
     def test_ingest_error_is_carried_into_the_side_outcome(self, keypair, card_with_qr) -> None:
-        pdf = b"%PDF-1.7\n" + b"0" * 80_000
-        result = make_verifier(keypair).verify(sides(pdf, card_with_qr))
+        """⚠ Uses a ZIP, not a PDF.
+
+        This test is about an ingest rejection reaching the side outcome — the
+        file type was only ever a convenient way to trigger one. It used a PDF
+        until PDF became a supported input, at which point it would have been
+        asserting a policy it does not care about. A ZIP is still refused and
+        keeps the test measuring what its name claims.
+        """
+        archive = b"PK\x03\x04" + b"0" * 80_000
+        result = make_verifier(keypair).verify(sides(archive, card_with_qr))
         front = next(s for s in result.sides if s.side is CardSide.FRONT)
         assert front.error is ErrorCode.UNSUPPORTED_MIME_TYPE

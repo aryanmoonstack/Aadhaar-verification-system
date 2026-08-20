@@ -104,7 +104,15 @@ def message_for(verdict: Verdict, checks: dict[CheckName, CheckOutcome]) -> str:
 
     if verdict is Verdict.VERIFIED:
         agreement = checks.get(CheckName.SIDE_AGREEMENT)
-        if agreement is not None and agreement.result is CheckResult.SKIP:
+        # ⚠ Only when a SECOND face was actually submitted and turned out to be
+        #   unusable. A single-document upload (one PDF, §11) also reports SKIP,
+        #   and telling that employee "one of the photos was unclear" sends them
+        #   looking for a bad photo they never uploaded.
+        if (
+            agreement is not None
+            and agreement.result is CheckResult.SKIP
+            and "single document" not in (agreement.detail or "")
+        ):
             return (
                 "Your Aadhaar has been verified. One of the photos was unclear, "
                 "but the QR code confirmed your details."

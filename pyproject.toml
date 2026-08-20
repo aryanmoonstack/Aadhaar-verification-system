@@ -32,6 +32,13 @@ crypto = [
 ingest = [
     "pillow>=10.3",
     "pillow-heif>=0.16",
+    # PDF rendering. pypdfium2 wraps PDFium (the engine in Chrome) and ships
+    # prebuilt wheels for Windows, macOS and Linux — no system package needed.
+    #
+    # ⚠ Chosen over PyMuPDF deliberately: PyMuPDF is AGPL, which would impose
+    #   source-disclosure obligations on the HRM that embeds this service.
+    #   pypdfium2 is Apache-2.0 / BSD-3.
+    "pypdfium2>=4.30",
 ]
 
 # ── Step 4-5: preprocessing and QR decoding ──────────────────────────────────

@@ -106,6 +106,8 @@ class ImageIngestor:
         max_pixels_per_byte: float = 150.0,
         scanner: MalwareScanner | None = None,
         strip_metadata: bool = True,
+        pdf_render_dpi: int = 300,
+        pdf_max_pixels_per_byte: float = 1000.0,
     ) -> None:
         """
         Args:
@@ -123,6 +125,11 @@ class ImageIngestor:
             scanner: optional malware scanner. When None, scanning is skipped.
             strip_metadata: discard EXIF (including GPS) during normalisation.
                 Leave enabled unless you have a specific reason not to.
+            pdf_render_dpi: resolution for rendering PDF pages. See
+                ``avs.ingest.pdf.DEFAULT_RENDER_DPI`` for why 300 and not 150.
+            pdf_max_pixels_per_byte: the bomb heuristic for *rendered pages*,
+                which compress far better than photographs. Measured separately
+                — see ``_pdf_page_ingestor``.
         """
         self.min_bytes = min_bytes
         self.max_bytes = max_bytes
@@ -133,6 +140,8 @@ class ImageIngestor:
         self.max_pixels_per_byte = max_pixels_per_byte
         self.scanner = scanner
         self.strip_metadata = strip_metadata
+        self.pdf_render_dpi = pdf_render_dpi
+        self.pdf_max_pixels_per_byte = pdf_max_pixels_per_byte
 
     # ------------------------------------------------------------------ #
 
@@ -141,14 +150,39 @@ class ImageIngestor:
         data: bytes,
         filename: str | None = None,
         capture_method: CaptureMethod = CaptureMethod.UNKNOWN,
+        password: str | None = None,
     ) -> ValidatedImage:
-        """Validate, normalise, and hash an uploaded image.
+        """Validate, normalise, and hash one uploaded file.
+
+        For a PDF this returns the **first** page. Callers that need every page
+        — anything searching for a QR code — must use ``ingest_all`` instead,
+        because the Secure QR is frequently not on page one.
 
         The ``filename`` is used only for error messages. It never influences
         type detection — see ``avs.ingest.magic``.
 
         Raises:
             IngestError: with an ErrorCode from the ingest family.
+        """
+        return self.ingest_all(data, filename, capture_method, password)[0]
+
+    def ingest_all(
+        self,
+        data: bytes,
+        filename: str | None = None,
+        capture_method: CaptureMethod = CaptureMethod.UNKNOWN,
+        password: str | None = None,
+    ) -> list[ValidatedImage]:
+        """Validate one upload and return every image it contains.
+
+        An image yields a single-element list. A PDF yields one entry per
+        rendered page, in document order.
+
+        ★ This is the real entry point; ``ingest`` is a one-page convenience
+          wrapper kept so existing callers did not have to change.
+
+        Args:
+            password: for an encrypted PDF. Ignored for images. Never logged.
         """
         original_size = len(data)
 
@@ -163,9 +197,44 @@ class ImageIngestor:
         # "image too small" — while decoders still stay strictly downstream.
         detected = self._check_type(data)
 
+        if detected is FileKind.PDF:
+            # ⚠ The malware scan runs on the ORIGINAL PDF bytes, before the
+            #   renderer parses them — same ordering rule as for an image, and it
+            #   matters more here, since a PDF can carry embedded payloads that
+            #   vanish once the page is rasterised.
+            self._scan(data)
+            return self._ingest_pdf(data, original_size, capture_method, password)
+
+        # ⚠ The lower-size floor is deliberately NOT applied to a PDF. Its
+        #   justification — "too few bytes to hold a readable QR" — is about
+        #   photographs. A Secure QR stored as vector data renders perfectly from
+        #   a 20 KB file, so the same floor would reject valid documents.
         self._check_lower_size(original_size)
         self._scan(data)
 
+        return [self._ingest_image(data, detected, original_size, capture_method)]
+
+    # ------------------------------------------------------------------ #
+
+    def _ingest_image(
+        self,
+        data: bytes,
+        detected: FileKind,
+        reported_size: int,
+        capture_method: CaptureMethod,
+        identity_sha256: str | None = None,
+    ) -> ValidatedImage:
+        """The image path: header read, bomb guards, decode, normalise.
+
+        Args:
+            reported_size: the size recorded on the result. For a PDF page this
+                is the size of the *source PDF*, not the rendered PNG — the
+                audit trail should describe what the employee uploaded.
+            identity_sha256: overrides the hash. Set for PDF pages so every page
+                carries the digest of the original document rather than of a
+                render, which is not reproducible across renderer versions.
+        """
+        original_size = len(data)
         image = self._open_header(data, detected)
         try:
             width, height = image.size
@@ -177,7 +246,7 @@ class ImageIngestor:
         # Hash the ORIGINAL bytes, not the normalised ones. This is the audit
         # identity of what the employee actually uploaded, and it stays stable
         # across Pillow versions — a normalised hash would not.
-        digest = hashlib.sha256(data).hexdigest()
+        digest = identity_sha256 or hashlib.sha256(data).hexdigest()
 
         with Image.open(io.BytesIO(normalised)) as final:
             final_width, final_height = final.size
@@ -187,9 +256,134 @@ class ImageIngestor:
             mime_type=mime_type,
             width=final_width,
             height=final_height,
-            size_bytes=original_size,
+            size_bytes=reported_size or original_size,
             sha256=digest,
             capture_method=capture_method,
+        )
+
+    # ------------------------------------------------------------------ #
+    # The PDF path — render, then rejoin the image path above
+    # ------------------------------------------------------------------ #
+
+    def _ingest_pdf(
+        self,
+        data: bytes,
+        original_size: int,
+        capture_method: CaptureMethod,
+        password: str | None,
+    ) -> list[ValidatedImage]:
+        """Render every page, then validate each one as an ordinary image.
+
+        ★ The rejoin is the point. Rendered pages go through exactly the same
+          header read, bomb guards and metadata stripping as an uploaded JPEG.
+          Nothing downstream of here knows a PDF was involved, and no guard had
+          to be duplicated or relaxed to make that true.
+
+        ⚠ Bomb guards are applied with PDF-specific limits. The photograph
+          limits do not transfer — see ``_pdf_page_ingestor``.
+        """
+        from avs.ingest.pdf import render_pdf  # local: keeps pypdfium2 optional
+
+        pages = render_pdf(data, password=password, dpi=self.pdf_render_dpi)
+
+        # One identity for the whole document. Each page is a view of the same
+        # uploaded file, so they share its digest rather than inventing one per
+        # render — a render hash would change with the renderer version and
+        # break duplicate detection silently.
+        digest = hashlib.sha256(data).hexdigest()
+
+        page_ingestor = self._pdf_page_ingestor()
+        validated: list[ValidatedImage] = []
+        failures: list[IngestError] = []
+
+        for page in pages:
+            try:
+                validated.append(
+                    page_ingestor._ingest_image(
+                        page.data,
+                        FileKind.PNG,
+                        original_size,
+                        capture_method,
+                        identity_sha256=digest,
+                    )
+                )
+            except IngestError as exc:
+                # One unusable page does not condemn the document — the QR may
+                # be on another one. Only an all-pages failure is fatal.
+                exc.message = f"page {page.page_number}: {exc.message}"
+                failures.append(exc)
+
+        if not validated:
+            raise self._pdf_failure(failures)
+
+        return validated
+
+    @staticmethod
+    def _pdf_failure(failures: list[IngestError]) -> IngestError:
+        """Collapse per-page failures into one error, keeping the code when it agrees.
+
+        ⛔ Flattening everything to CORRUPT_IMAGE loses information that matters.
+           A PDF whose pages all exceed the pixel ceiling is a decompression
+           bomb; reporting it as "damaged PDF" files it under the wrong
+           category, and an operator reading the audit trail would never see the
+           attack. The specific code survives whenever every page agrees on it.
+        """
+        codes = {failure.code for failure in failures}
+        detail = "; ".join(failure.message for failure in failures)
+
+        if len(codes) == 1:
+            single = failures[0]
+            return IngestError(single.code, detail, single.user_message)
+
+        return IngestError(
+            ErrorCode.CORRUPT_IMAGE,
+            f"no page of the PDF passed validation — {detail}",
+            "This PDF could not be read. Please upload a photo of your "
+            "Aadhaar card instead.",
+        )
+
+    def _pdf_page_ingestor(self) -> ImageIngestor:
+        """A sibling ingestor with limits appropriate to a rendered page.
+
+        ⛔ Two of the photograph limits are actively wrong for rendered pages,
+           and both would reject valid documents:
+
+           ``max_pixels_per_byte`` is a decompression-bomb heuristic tuned on
+           camera photos, which are noisy and compress poorly. A rendered page is
+           mostly flat white and compresses extremely well.
+
+           Measured, A4 at 300 DPI (2481x3508, 8.7 MP):
+
+               page content        PNG bytes     px/byte
+               ---------------------------------------------
+               near-blank             33,160       262.5   <- over the photo limit
+               text only              54,567       159.5   <- over the photo limit
+               text + Secure QR      142,752        61.0
+
+           The photograph limit is 150. Two of those three valid pages exceed
+           it, so keeping it would have rejected real e-Aadhaar documents —
+           most likely a sparse second page, which is the hardest failure to
+           reproduce and diagnose.
+
+           1000 leaves roughly 4x headroom over the worst measured page. The
+           guard is raised rather than removed, and it was never the real
+           protection anyway: ``max_pixels`` bounds memory absolutely, and
+           ``avs.ingest.pdf`` refuses a page over 40 MP before allocating the
+           bitmap at all.
+
+           ``min_bytes`` is about photographs holding enough detail to decode.
+           It says nothing useful about a losslessly rendered page.
+        """
+        return ImageIngestor(
+            min_bytes=1,
+            max_bytes=self.max_bytes,
+            min_width=self.min_width,
+            min_height=self.min_height,
+            max_dimension=self.max_dimension,
+            max_pixels=self.max_pixels,
+            max_pixels_per_byte=self.pdf_max_pixels_per_byte,
+            scanner=None,  # already scanned, on the original PDF bytes
+            strip_metadata=self.strip_metadata,
         )
 
     # ------------------------------------------------------------------ #

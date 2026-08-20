@@ -51,14 +51,16 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from avs import __version__
 from avs.api.callbacks import CallbackDispatcher
 from avs.api.models import (
+    Decision,
     JobAccepted,
     JobStatusResponse,
     ReadyResponse,
     VerifyUrlRequest,
 )
 from avs.audit import AuditEntry, AuditSink, FileAuditTrail, NullAuditSink, utc_now
-from avs.contracts import CardSide, ErrorCode, Strictness
+from avs.contracts import CardSide, DecisionStatus, ErrorCode, Strictness
 from avs.crypto import SecureQrVerifier
+from avs.ingest import FileKind, detect
 from avs.logging import configure_logging, get_logger
 from avs.pipeline import DocumentVerifier, SideInput
 from avs.privacy import DataMinimisingFilter
@@ -409,7 +411,11 @@ def _register_routes(app: FastAPI) -> None:
         #   202 followed by a job that fails a second later for reasons they
         #   cannot see. Refusing early also means a probing attacker gets no
         #   queue slot at all.
-        for label, url in (("front_url", request.front_url), ("back_url", request.back_url)):
+        candidates = [("front_url", request.front_url)]
+        if request.back_url is not None:
+            candidates.append(("back_url", request.back_url))
+
+        for label, url in candidates:
             check = is_safe_url(str(url), allow_private=state.fetcher.allow_private)
             if not check.ok:
                 log.warning(
@@ -436,8 +442,18 @@ def _register_routes(app: FastAPI) -> None:
 
         async def work() -> Any:
             front = await state.fetcher.fetch(str(request.front_url))
-            back = await state.fetcher.fetch(str(request.back_url))
-            return _run_pipeline(state, job_id, front, back, request.strictness, tenant)
+            back = (
+                await state.fetcher.fetch(str(request.back_url))
+                if request.back_url is not None
+                else None
+            )
+            # ⚠ Checked on the worker, not in the handler. Unlike an upload,
+            #   the bytes do not exist until they are fetched — so the "one PDF
+            #   is enough, one image is not" rule cannot be applied any earlier.
+            _require_two_faces(front, back)
+            return _run_pipeline(
+                state, job_id, front, back, request.strictness, tenant, request.password
+            )
 
         return await _submit_async(state, job_id, work, request.callback_url)
 
@@ -445,20 +461,38 @@ def _register_routes(app: FastAPI) -> None:
     async def verify_from_upload(
         state: State,
         tenant: Tenant,
-        front: Annotated[UploadFile, File(description="Photo of the FRONT of the card")],
-        back: Annotated[UploadFile, File(description="Photo of the BACK of the card")],
+        front: Annotated[UploadFile, File(description="FRONT of the card, or a whole PDF")],
+        back: Annotated[UploadFile | None, File(description="BACK of the card")] = None,
         job_id: Annotated[str | None, Form()] = None,
         callback_url: Annotated[str | None, Form()] = None,
         strictness: Annotated[str | None, Form()] = None,
+        password: Annotated[str | None, Form()] = None,
     ) -> JobAccepted:
-        """Queue a verification from directly uploaded images."""
+        """Queue a verification from uploaded images or a PDF.
+
+        Two shapes are accepted:
+
+        * **Two images** — ``front`` and ``back``. Both required. CONTRACTS.md §11.
+        * **One PDF** — ``front`` alone. Its pages already hold both faces.
+
+        ⚠ ``password`` is for an encrypted PDF. e-Aadhaar files downloaded from
+          UIDAI are password-protected, so this is a routine field rather than
+          an unusual one.
+
+        ⛔ It is held in memory for the life of the job and never logged,
+           audited or returned. ``tests/unit/test_pdf_pipeline.py`` asserts it
+           cannot reach the result.
+        """
         identifier = job_id or str(uuid.uuid4())
         front_bytes = await front.read()
-        back_bytes = await back.read()
+        back_bytes = await back.read() if back is not None else None
+        _require_two_faces(front_bytes, back_bytes)
         level = Strictness(strictness.upper()) if strictness else None
 
         def work() -> Any:
-            return _run_pipeline(state, identifier, front_bytes, back_bytes, level, tenant)
+            return _run_pipeline(
+                state, identifier, front_bytes, back_bytes, level, tenant, password
+            )
 
         return _submit(state, identifier, work, callback_url)
 
@@ -467,8 +501,9 @@ def _register_routes(app: FastAPI) -> None:
         state: State,
         tenant: Tenant,
         front: Annotated[UploadFile, File()],
-        back: Annotated[UploadFile, File()],
+        back: Annotated[UploadFile | None, File()] = None,
         strictness: Annotated[str | None, Form()] = None,
+        password: Annotated[str | None, Form()] = None,
     ) -> dict[str, Any]:
         """Blocking verification. Admin and debugging only.
 
@@ -476,10 +511,25 @@ def _register_routes(app: FastAPI) -> None:
         the service trivially testable with curl; not intended for the HRM.
         """
         level = Strictness(strictness.upper()) if strictness else None
+        front_bytes = await front.read()
+        back_bytes = await back.read() if back is not None else None
+        _require_two_faces(front_bytes, back_bytes)
+
         result = _run_pipeline(
-            state, str(uuid.uuid4()), await front.read(), await back.read(), level, tenant
+            state,
+            str(uuid.uuid4()),
+            front_bytes,
+            back_bytes,
+            level,
+            tenant,
+            password,
         )
-        return result.model_dump(mode="json")
+        body = result.model_dump(mode="json")
+        # Same projection the polling endpoint returns, so a client written
+        # against one shape works against the other.
+        decision = _decision_for(result)
+        body["decision"] = decision.model_dump(mode="json") if decision else None
+        return body
 
     @app.get("/v1/verify/{job_id}", response_model=JobStatusResponse, tags=["verify"])
     async def get_job(job_id: str, state: State, tenant: Tenant) -> JobStatusResponse:
@@ -496,6 +546,7 @@ def _register_routes(app: FastAPI) -> None:
         return JobStatusResponse(
             job_id=job.job_id,
             status=job.status.value,
+            decision=_decision_for(job.result),
             result=job.result,
             error=job.error,
             queued_ms=job.queued_ms,
@@ -650,13 +701,103 @@ def _register_routes(app: FastAPI) -> None:
 # --------------------------------------------------------------------------- #
 
 
+def _decision_for(result: Any) -> Decision | None:
+    """Project a settled result into the three fields a front end needs.
+
+    ⛔ THE DOWNGRADE ON THE LAST LINE IS THE POINT OF THIS FUNCTION.
+
+       ``Verdict.VERIFIED`` alone does not produce APPROVED here. The proof must
+       also be valid. That is CONTRACTS.md §1 Rule 1 restated at the boundary,
+       and it means a bug anywhere upstream — the rules engine, the pipeline, a
+       future refactor — cannot hand a client an approval with no signature
+       behind it. It would arrive as REVIEW instead: visibly wrong, seen by a
+       human, rather than quietly approved.
+
+       ``VerificationResult.is_auto_approve`` already applies the same pairing.
+       Repeating it is not redundancy for its own sake; this is the last place
+       the two facts are together before they leave the service.
+    """
+    if result is None:
+        return None
+
+    verdict = result.verdict
+    signature_valid = result.proof is not None and result.proof.valid is True
+    status = verdict.decision_status
+
+    if status is DecisionStatus.APPROVED and not signature_valid:
+        log.error(
+            "approval_without_signature_downgraded",
+            job_id=result.job_id,
+            verdict=verdict.value,
+            detail="VERIFIED arrived with no valid proof — routed to human review",
+        )
+        status = DecisionStatus.REVIEW
+
+    return Decision(
+        status_code=status.http_status,
+        status=status,
+        message=result.user_message,
+        needs_review=verdict.requires_human_review or status is DecisionStatus.REVIEW,
+        verdict=verdict.value,
+        signature_valid=signature_valid,
+    )
+
+
+def _require_two_faces(front: bytes, back: bytes | None) -> None:
+    """Refuse a lone IMAGE. Allow a lone PDF.
+
+    ⛔ WHY THE EXCEPTION IS NOT A WEAKENING — CONTRACTS.md §11
+
+       §11 requires both faces because of one specific attack: take a genuine
+       Aadhaar back with a valid Secure QR, pair it with a **forged front**. The
+       signature verifies perfectly, because the QR really is genuine; only the
+       printed face is fake. Collecting both faces and diffing the printed text
+       against the signed QR fields is what closes it.
+
+       That attack needs the two faces to come from **different sources**. Two
+       separate photographs can. The pages of one PDF cannot — they arrived as
+       one file.
+
+       And note what the old behaviour actually did: an employee holding a
+       single PDF had to submit the *same bytes* twice, once per slot. That
+       added no evidence whatsoever. It also produced a misleading
+       `SIDE_AGREEMENT = PASS, "both sides carry the same payload"` — a
+       tautology reading as corroboration. One upload reports `SKIP`, which is
+       the truth.
+
+    ⚠ What this does NOT fix: a PDF containing only a QR page and no printed
+      face leaves the Step 17 cross-check nothing to compare. That was equally
+      true when the same file was uploaded twice, so nothing regressed — but it
+      is a real limit, not a solved problem.
+    """
+    if back is not None:
+        return
+
+    if detect(front).kind is FileKind.PDF:
+        return
+
+    raise HTTPException(
+        status_code=400,
+        detail={
+            "code": ErrorCode.INVALID_REQUEST.value,
+            "message": "a single image is not enough; upload both faces, or one PDF",
+            "user_message": (
+                "Please upload both the front and the back of your Aadhaar card. "
+                "If you have the Aadhaar PDF, you can upload that on its own instead."
+            ),
+            "retryable": True,
+        },
+    )
+
+
 def _run_pipeline(
     state: AppState,
     job_id: str,
     front: bytes,
-    back: bytes,
+    back: bytes | None,
     strictness: Strictness | None,
     tenant_id: str = "unknown",
+    password: str | None = None,
 ) -> Any:
     verifier = state.verifier
     if strictness is not None and strictness is not verifier.strictness:
@@ -673,10 +814,16 @@ def _run_pipeline(
             time_budget_seconds=verifier.time_budget_seconds,
         )
 
-    result = verifier.verify(
-        [SideInput(CardSide.FRONT, front), SideInput(CardSide.BACK, back)],
-        job_id=job_id,
-    )
+    # ⚠ One SideInput when a PDF was submitted alone. The pipeline is already
+    #   agnostic about how many it receives — `_side_agreement` compares a SET
+    #   of payloads, so one entry simply has nothing to compare and reports
+    #   SKIP. Nothing here needed a special case; the guard above is what
+    #   decides whether a single upload was legitimate in the first place.
+    inputs = [SideInput(CardSide.FRONT, front, password=password)]
+    if back is not None:
+        inputs.append(SideInput(CardSide.BACK, back, password=password))
+
+    result = verifier.verify(inputs, job_id=job_id)
     state.count(result.verdict.value)
 
     # ★ THE DECODE RATE — the project's primary metric, never instrumented

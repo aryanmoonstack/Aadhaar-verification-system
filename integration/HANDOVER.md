@@ -1,7 +1,7 @@
 # Handover to the M-One HRM team
 
-After Steps 10 and 11. **Yes — there is work you can hand over now**, and some
-that should wait.
+**Contract 2.0.0.** Rewritten 20 Aug 2026, when the architecture changed: the
+frontend now calls AVS directly and the Spring backend was dropped.
 
 ---
 
@@ -9,215 +9,192 @@ that should wait.
 
 | | |
 |---|---|
-| **Backend dev** | 12 Java files + 1 SQL migration. Ready to integrate. |
-| **Frontend dev** | 4 TypeScript files + 27 tests. Ready to integrate. |
+| **Frontend dev** | Owns the whole integration. 8 TypeScript files + 80 tests. |
+| **Backend dev** | One SQL migration to apply. Nothing else. |
 | **You** | Deploy AVS, generate two secrets, pin the certificates. |
-| **Wait for later steps** | HR review screen (Step 20), duplicate detection (Step 18), profile matching (Step 18). |
+| **Later steps** | HR review screen (Step 20), duplicate detection (Step 18), profile matching (Step 18). |
 
-Nothing here is a prototype. The Java signing was proven byte-for-byte against
-the running Python service, and a Java-built request produced a real `VERIFIED`
-in 3.3 seconds.
+⚠ **What changed, and why it matters if you saw the previous version.** There
+were 12 Java files here. They were deleted, not lost: the Next.js route handler
+now signs and calls AVS itself, so the Java HTTP client, HMAC signing and
+controllers had no caller. The signing proof survives — `lib/avsSignature.ts`
+carries its own six vectors verified against the Python service.
+
+The one file that did **not** become dead is the database schema, which moved to
+`migrations/001_aadhaar_verification.sql`. It encodes two constraints nothing
+else enforces.
 
 ---
 
-## 1. Backend developer — `integration/spring/`
+## 1. Frontend developer — `integration/nextjs/`
 
-Copy `src/main/java/cloud/mone/hrm/aadhaar/` into the HRM and the migration into
-your Flyway directory.
+This is now the entire integration. Copy into the HRM app.
 
-| File | What it does |
+| File | |
 |---|---|
-| `AvsSignature` | HMAC signing and verification, both directions |
-| `AvsClient` | Signed submission to AVS |
-| `AadhaarSubmitController` | `POST /submit`, `GET /status/{jobId}`, `GET /review-queue` |
-| **`AvsCallbackController`** | **Receives the verdict. Read the warning below.** |
-| `AadhaarVerificationService` | The only class the rest of the HRM should touch |
-| `AadhaarVerification` + repository | JPA entity and queries |
-| `AvsVerdict`, `AvsResult`, `AvsProperties` | Contract types and config |
-| `V1__aadhaar_verification.sql` | PostgreSQL schema |
-| `AvsSignatureTest` | 8 tests including the cross-language vector |
+| `lib/avsSignature.ts` | HMAC signing + hand-built multipart. **The risky part** |
+| `lib/avsClient.ts` | Transport. `server-only` |
+| `lib/aadhaarPdfPassword.ts` | Derives the e-Aadhaar password from the profile |
+| `lib/verificationStore.ts` | Writes approved verifications to the HRM database |
+| `app/api/aadhaar/verify/route.ts` | Submit. Signs server-side |
+| `app/api/aadhaar/verify/[jobId]/route.ts` | Poll. Records the result |
+| `components/AadhaarUpload.tsx` | File picker, pre-check, PDF + password |
+| `lib/qrPrecheck.ts`, `captureQuality.ts`, `exif.ts` | Browser pre-check |
+
+```bash
+npm install pg @types/pg server-only
+cp .env.example .env.local     # then fill it in
+```
 
 ### ⛔ Tell them this before they open the files
 
-**`AvsCallbackController` is where the chain of trust ends.** It is reachable
-from wherever AVS runs. If it accepted an unsigned body, anyone who could reach
-that URL could POST `{"verdict":"VERIFIED"}` and approve a forged Aadhaar —
-bypassing the RSA check, the pinned trust store and the audit trail in a single
-request.
+**1. The secret is server-side, and one prefix decides that.**
 
-The HMAC is verified over the **raw body, before parsing**. Do not add a bypass
-"just for local testing".
+`AVS_SECRET` is read only inside route handlers, which run in Node. Naming it
+`NEXT_PUBLIC_AVS_SECRET` would compile the signing key into the JavaScript every
+visitor downloads. `import 'server-only'` makes a mistaken client import fail the
+**build** rather than leak quietly.
+
+**2. Never replace the hand-built multipart with `FormData`.**
+
+The signature covers the raw body bytes. Handing a `FormData` to `fetch` lets
+undici generate the body with its own boundary at send time — you sign one byte
+sequence and transmit another. Measured against a live service with auth on:
+
+```
+FormData (regenerated body)  ->  HTTP 401
+hand-built Buffer            ->  HTTP 202
+```
+
+The 401 reads as a credential problem while the credentials are perfect.
+
+**3. Approve only on the pair.**
+
+```ts
+decision.verdict === 'VERIFIED' && decision.signature_valid === true
+```
+
+`saveVerification()` asserts this before writing, and the database constraint
+enforces it independently.
+
+**4. Never rewrite `decision.message`.** It is worded so it never accuses anyone.
+The word "fake" must not appear in employee-facing text — a genuine card
+photographed badly is not a forgery.
+
+**5. The pre-check must never block upload.** A photo the browser cannot read may
+still decode on the server, which runs 23 preprocessing variants the browser
+does not, and Safari has no detector at all.
+
+### The PDF password is derived, not asked for
+
+An e-Aadhaar from UIDAI is encrypted, and most employees do not know it has a
+password. The submit route computes it from their profile — first 4 characters
+of the name in capitals plus the birth year — so the password box normally never
+appears. It is shown only when that derivation misses.
+
+⛔ **Name and DOB must come from the SESSION, never the request body.** A
+browser-supplied name would let anyone compute a password for someone else's
+document. The reference reads `x-employee-name` and `x-employee-birth-year` as
+stand-ins; replace them with your session lookup.
+
+⚠ **A miss is ordinary, not exceptional** — it happens whenever the HRM name
+differs from the Aadhaar name (`Raj Sharma` vs `Rajkumar Sharma`, surname first,
+initials). When it happens the employee is *asked*, and the wording is a first
+request. Never "wrong password": they typed nothing, the guess was ours.
+
+⛔ **The PDF is never decrypted to disk.** The password is passed to AVS in
+memory. Unlocking and re-saving would leave a readable Aadhaar in a temp
+directory — exactly what UIDAI encrypted it to prevent.
+
+### Three things left for them, marked in the code
+
+- **Bind `jobId` to the employee** in the poll route. Job ids are UUIDs and
+  unguessable, but unguessable is not authorised — anyone who learned an id
+  could otherwise read someone else's outcome.
+- **Replace the `x-employee-id` header** with your real session helper.
+- **Replace `x-employee-name` / `x-employee-birth-year`** with the same session
+  lookup, for the password derivation above.
+
+---
+
+## 2. Backend developer — one migration
+
+```
+migrations/001_aadhaar_verification.sql
+```
+
+Apply it with Flyway, Liquibase or by hand. Plain PostgreSQL, no dependencies.
 
 **Rule 1 is enforced by the database, not by convention:**
 
 ```sql
 CHECK (verdict <> 'VERIFIED' OR signature_valid = TRUE)
-CHECK (aadhaar_last4 ~ '^[0-9]{4}$')
+CHECK (aadhaar_last4 IS NULL OR aadhaar_last4 ~ '^[0-9]{4}$')
 ```
 
 No future migration or manual `UPDATE` can approve something the cryptography
 did not, and storing a full Aadhaar number fails the INSERT rather than
 succeeding quietly.
 
-**Approve only via `record.isApproved()`.** It checks the verdict *and*
-`signatureValid`. Checking the verdict string alone would mean a mislabelling
-bug could approve a forgery.
+⚠ **Only approved verifications are written.** Failures show the employee a
+re-upload message and are not stored, so failed attempts and their identity data
+never accumulate. The review columns are unused today — `PROFILE_MISMATCH`,
+`TEXT_MISMATCH` and `DUPLICATE` are not reachable until Steps 17 and 18. They
+exist now so that adding them later is not a migration against live identity
+data.
 
-### What they must write themselves
-
-- Session authentication on `/submit` and `/review-queue`
-- Wiring `employeeId` from your existing employee model
-- `@EnableConfigurationProperties(AvsProperties.class)`
-
-### Expect one round of small fixes
-
-I had no `javac` or Maven, so the Java is **written and unit-tested by
-construction, not compiled**. What I could verify, I did: the HMAC against the
-live Python service, the multipart bytes against the real server, the DDL
-against PostgreSQL's own parser. The first `mvn test` may still surface an
-import or a style nit. Send it to me and I'll fix it.
+⚠ **If the HRM database is not reachable from the Next.js app** — plausible for a
+multi-tenant SaaS — replace the body of `saveVerification()` in
+`lib/verificationStore.ts` with a call to your internal API. That function is the
+only place that knows how records are stored; nothing else changes.
 
 ---
 
-## 2. Frontend developer — `integration/nextjs/`
-
-| File | |
-|---|---|
-| **`components/AadhaarUpload.tsx`** | **★ USE THIS. Two-sided file upload with pre-check** |
-| `components/AadhaarCapture.tsx` | ⚠ Live camera. **Not** what M-One uses — see below |
-| `lib/qrPrecheck.ts` | Decodes the QR **in the browser before upload** |
-| `lib/captureQuality.ts` | Resolution, blur and QR-size rules |
-| `lib/exif.ts` | Detects the messaging-app re-encode fingerprint |
-| `app/api/aadhaar/verify/route.ts` | Session-authenticated proxy to Spring |
-| `lib/__tests__/` | 36 tests, `lib/` is `tsc --strict` clean |
-
-### ⛔ Which component to use
-
-**`AadhaarUpload.tsx`.** M-One offers file upload, not in-app capture.
-
-`AadhaarCapture.tsx` was built first and opens `getUserMedia` — it has no file
-input at all, so it does not fit the product. It is kept because the live-camera
-route remains a legitimate future option, not because it is the current one.
-
-Both share `lib/` unchanged: `precheck()` takes an `ImageBitmapSource`, and
-`File` extends `Blob`, so the same code runs on a picked file with no
-conversion.
-
-⚠ **What upload-only gives up.** Live capture can say "move closer" *while* the
-person is framing. Upload can only say "that one will not work, choose another"
-after the photo exists. 29% of measured failures were "too far back" — guidance
-in the moment would have prevented those. The pre-check still catches them, one
-step later. That is a product trade, not a technical limit.
-
-### ⛔ Tell them this
-
-**The browser must never call AVS directly.** It cannot hold an HMAC secret —
-anything shipped to a client is public. Images go to the HRM, which signs
-server-side. A refactor that "simplifies" this puts your tenant key in a
-JavaScript bundle.
-
-**The pre-check is not a verdict.** The browser decodes only to answer *"is this
-photo good enough to send?"* `PrecheckResult` has no `verified` field and a test
-asserts it never gains one.
-
-**Never write the word "fake" in any employee-facing string.** A genuine card
-photographed badly is indistinguishable from a forgery to any automated check,
-which is exactly why no automated check may call it one. Use the `userMessage`
-the service returns — it is deliberately worded.
-
-### What the upload flow must get right
-
-Measured on 27 real Aadhaar photographs run through the actual decoder:
-
-- **Never block the upload.** A photo the browser cannot read may still decode
-  on the server, which runs 23 preprocessing variants the browser does not — and
-  on Safari the detector is simply absent. Disabling Submit on a failed
-  pre-check would lock those people out of the product.
-- **Accept HEIC.** iPhones produce it by default. The `accept` attribute already
-  lists it; the server handles it.
-- **Never downscale before upload.** A well-intentioned client-side resize
-  destroys exactly the QR resolution the decode depends on.
-- **The word "fake" must never appear** in any employee-facing string. A genuine
-  card photographed badly is indistinguishable from a forgery to any automated
-  check, which is precisely why no automated check may call it one.
-
-### What they must write themselves
-
-- The session helper in `route.ts` (marked `// Replace with your session helper`)
-- Styling — the component ships unstyled
-- A polling loop against `GET /api/kyc/aadhaar/status/{jobId}`
-- `npm install zxing-wasm` only if you support Safari or Firefox
-
-### ⚠ The one thing still untested anywhere
-
-`BarcodeDetector` has **never run on a real device**. The logic is type-checked
-and unit-tested against fakes, but the browser API itself is unexercised. Test
-Android Chrome first — it has the native detector. This is the single highest-
-value thing on the whole list.
-
----
-
-## 3. Yours before a pilot
-
-**Deploy AVS** behind TLS. `avs serve --tenants tenants.json --audit audit.jsonl`
-
-**Generate two secrets** — `openssl rand -hex 32` each. One for requests, one
-for callbacks. Both go into the environment on each side, never into a file.
-
-**⚠ Pin the certificates.** You have five in `certs/` and no `FINGERPRINTS.txt`,
-which means anyone who can write to that directory can add a certificate and
-mint approvals:
+## 3. You — deployment
 
 ```powershell
 python -m avs.cli certs pin --dir certs
+python scripts\preflight.py --url https://<the AVS URL>
 ```
 
-**Alert on `avs_decode_rate < 0.85`.** It is the primary metric and it measured
-22.7% on real photos before Step 11.
+Two secrets, not three — see `docs/SECRETS.md`. The callback secret is not
+needed; the integration polls.
+
+Deploy with `--budget 5`.
 
 ---
 
-## 4. Wait for later steps — do not build these now
+## What to watch
 
-| Feature | Step | Why wait |
-|---|---|---|
-| HR review screen | 20 | The `review-queue` endpoint exists; the UI comes with the reviewer tooling |
-| Duplicate detection | 18 | Repository query exists but is unused. Needs the matching rules |
-| Name/DOB profile matching | 18 | Needs fuzzy matching — Indian name variants are their own problem |
-| Capture-quality model | 14 | The heuristics shipped in Step 11 are the interim version |
-| On-device guidance model | 16 | Improves the pre-check; the pre-check already works |
+`avs_decode_rate` in `/metrics`. Alert on `< 0.85`, and on
+`avs_certificate_days_to_expiry < 90`.
 
-If a developer asks "should I add duplicate checking?" — no. The query is there
-so the schema is right, but the *rules* around it are Step 18.
+**30%** was the measured floor on photographs shot deliberately badly with no
+guidance. PDFs should be far higher — a rendered e-Aadhaar has no blur, glare or
+JPEG ringing. That is a prediction, not a measurement, until real e-Aadhaar PDFs
+have been through `scripts/local_e2e.py`.
 
 ---
 
-## 5. What is honestly still unknown
+## Known state at handover
 
-**The real-world decode rate after Step 11.** It was 22.7% before, and the
-browser pre-check should raise it sharply because it stops unusable photos being
-sent at all — but that is a prediction, not a measurement. The first week of
-`avs_decode_rate` will tell you.
+| | |
+|---|---|
+| Steps 0–14 + PDF support | ✅ complete |
+| Python tests | 801 |
+| TypeScript tests | 80 |
+| Real cards over real HTTP | ✅ VERIFIED, signature valid, audit chain intact |
+| PDF end to end, auth on | ✅ 202 → APPROVED, Node client → Python service |
+| Contract version | 2.0.0, consistent across code and document |
+| **Real e-Aadhaar PDF** | ✅ **VERIFIED, 2.3 s** — real UIDAI certificate, real signature |
+| Browser pre-check on a device | ❓ `BarcodeDetector` has never executed on real hardware |
 
-**The camera flow has never run in a browser.** The logic is type-checked and
-tested; `getUserMedia` and `BarcodeDetector` need a real device. Test Android
-Chrome first — it has the native detector.
+⚠ The real-PDF result comes from a corpus of three. One verified; one was a
+different person's password; one was a genuinely pre-2018 e-Aadhaar reported
+correctly as `LEGACY_FORMAT`. Enough to prove the path works end to end, not
+enough to quote a decode rate. Watch `avs_decode_rate` in the pilot.
 
-**Permanent image storage.** You chose to keep Aadhaar images permanently in the
-HRM. I'd still gently push back: after verification the signed QR fields plus
-the verdict and reference hash *are* the proof, and they are cryptographically
-stronger than a photograph. Keeping the images adds permanent liability without
-adding evidentiary value. Storing the verdict record permanently makes complete
-sense. Your call, and cheap to change now.
-
----
-
-## Suggested order
-
-1. Backend: migration + entity + service, no AVS calls yet
-2. You: deploy AVS, generate secrets, pin certificates
-3. Backend: wire `AvsClient` and the callback, test against the live service
-4. Frontend: capture component against the real `/submit`
-5. Pilot with 5–10 volunteers, watch `avs_decode_rate`
-
-Steps 1 and 2 are independent, so both developers can start immediately.
+★ Those three documents also found a bug that 800 tests could not — see D157.
+A real e-Aadhaar carries more than one QR, and the page search stopped at the
+first code it could read instead of the first *signed* one. Every synthetic
+fixture had exactly one QR, so nothing in the suite could have caught it.

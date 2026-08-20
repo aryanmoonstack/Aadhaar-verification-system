@@ -18,6 +18,7 @@ from avs.contracts.enums import (
     CardSide,
     CheckName,
     CheckResult,
+    DecisionStatus,
     DocType,
     ErrorCode,
     Strictness,
@@ -66,7 +67,7 @@ from avs.contracts.protocols import (
     VerdictEngine,
 )
 
-CONTRACT_VERSION = "1.9.0"
+CONTRACT_VERSION = "2.0.0"
 """Bumped only when CONTRACTS.md changes. Consumers may assert against this."""
 
 __all__ = [
@@ -115,6 +116,7 @@ __all__ = [
     "ValidatedImage",
     "VariantGenerator",
     # enums
+    "DecisionStatus",
     "Verdict",
     "VerdictEngine",
     "VerificationResult",

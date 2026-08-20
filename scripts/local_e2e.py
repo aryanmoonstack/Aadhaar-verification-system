@@ -60,11 +60,35 @@ def looks_like_an_image(path: Path) -> bool:
     return len(header) >= 12 and header[4:8] == b"ftyp"
 
 
+def looks_like_a_pdf(path: Path) -> bool:
+    """Magic bytes, not the extension — same rule the service applies.
+
+    ⚠ Matters here because a PDF saved from a browser is sometimes named
+      `.pdf.jpg` or has no extension at all, and an extension check would drop
+      exactly the files this harness now exists to measure.
+    """
+    try:
+        with path.open("rb") as handle:
+            return handle.read(5) == b"%PDF-"
+    except OSError:
+        return False
+
+
+def content_type_for(path: Path) -> str:
+    return "application/pdf" if looks_like_a_pdf(path) else "image/jpeg"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("folder", type=Path, help="Folder of card images (stays local)")
     parser.add_argument("--certs", type=Path, default=REPO_ROOT / "certs")
-    parser.add_argument("--pairs", type=int, default=6, help="How many front/back pairs to try")
+    parser.add_argument("--pairs", type=int, default=6, help="How many submissions to try")
+    parser.add_argument(
+        "--password",
+        default=None,
+        help="Password for encrypted PDFs. ⛔ Applied to every PDF in the folder, "
+        "so use a folder belonging to ONE person. Never written anywhere.",
+    )
     arguments = parser.parse_args()
 
     text = str(arguments.folder)
@@ -72,15 +96,55 @@ def main() -> int:
         print(f"⛔ That is the example path, not a real one: {text}")
         print("   e.g.  python scripts/local_e2e.py C:\\aadhaar-corpus\\phone-a-good-light")
         return 2
+
+    # ⛔ The same placeholder trap, one argument along. Documentation writes
+    #    `--password YOUR_PASSWORD` and it gets pasted verbatim; the run then
+    #    reports PDF_PASSWORD_INCORRECT, which reads as "your PDFs are broken"
+    #    rather than "you did not substitute the example".
+    if arguments.password and arguments.password.upper() in {
+        "YOUR_ACTUAL_PASSWORD",
+        "YOUR_PASSWORD",
+        "YOURPASSWORD",
+        "PASSWORD",
+        "<PASSWORD>",
+    }:
+        print(f"⛔ That is the example password, not a real one: {arguments.password}")
+        print("   Use the real e-Aadhaar password — first 4 letters of the name in")
+        print("   CAPITALS plus the birth year, e.g.  --password RAME1990")
+        print("   If the PDFs are not password-protected, omit --password entirely.")
+        return 2
+
+    # ⚠ Report a missing renderer HERE, not as a per-document failure. Without
+    #   pypdfium2 every PDF fails at ingest with the generic "could not open
+    #   your photos" message, which looks like a problem with the documents.
+    from avs.ingest.pdf import PDFIUM_AVAILABLE
+
+    if not PDFIUM_AVAILABLE:
+        print("\n⛔ pypdfium2 is NOT INSTALLED — every PDF will fail at ingest.")
+        print("   This is a new dependency. Install it with:")
+        print("       pip install pypdfium2")
+        print("   or:  pip install -e .[ingest]")
+        return 2
     if not arguments.folder.is_dir():
         print(f"⛔ No such folder: {arguments.folder}")
         return 2
 
-    images = [
-        p for p in sorted(arguments.folder.rglob("*")) if p.is_file() and looks_like_an_image(p)
-    ]
-    if not images:
-        print(f"⛔ No images under {arguments.folder}")
+    files = sorted(p for p in arguments.folder.rglob("*") if p.is_file())
+    pdfs = [p for p in files if looks_like_a_pdf(p)]
+    images = [p for p in files if looks_like_an_image(p)]
+
+    if not pdfs and not images:
+        print(f"⛔ No images or PDFs under {arguments.folder}")
+        # ⚠ Say what WAS there. An earlier version of this harness silently
+        #   filtered PDFs out and reported "no images", which reads as an empty
+        #   folder rather than a harness that cannot see the files in it.
+        if files:
+            from collections import Counter
+
+            seen = Counter(p.suffix.lower() or "(no extension)" for p in files)
+            print(f"   {len(files)} file(s) found, none recognised:")
+            for suffix, count in seen.most_common(8):
+                print(f"     {suffix:<18} {count}")
         return 1
 
     import httpx
@@ -128,25 +192,41 @@ def main() -> int:
         print(f"   Put the UIDAI public certificates in {arguments.certs}")
         return 1
 
-    # Pair consecutive images as front/back, the way an employee submits.
-    pairs = [(images[i], images[i + 1]) for i in range(0, len(images) - 1, 2)][: arguments.pairs]
-    if not pairs and images:
-        pairs = [(images[0], images[0])]
+    # ⛔ A PDF is submitted ALONE — its pages already carry both faces
+    #    (CONTRACTS.md §11). Pairing two PDFs would test something no employee
+    #    will ever do, and would double the rendering for no extra evidence.
+    #    Images are still paired front/back, the way an employee submits them.
+    submissions: list[tuple[Path, Path | None]] = [(p, None) for p in pdfs]
+    submissions += [(images[i], images[i + 1]) for i in range(0, len(images) - 1, 2)]
+    if not submissions and images:
+        submissions = [(images[0], images[0])]
+    submissions = submissions[: arguments.pairs]
 
-    print(f"\nSubmitting {len(pairs)} pair(s) over HTTP, polling like the HRM will.\n")
-    print(f"{'pair':<6}{'verdict':<12}{'sig':<7}{'approve':<9}{'ms':>7}  message")
-    print("-" * 88)
+    if pdfs:
+        print(f"\n  {len(pdfs)} PDF(s) — each submitted alone, pages searched for the QR")
+    if len(images) > 1:
+        print(f"  {len(images)} image(s) — paired front/back")
+    if pdfs and not arguments.password:
+        print("  ⚠ No --password given. An encrypted e-Aadhaar will report")
+        print("    PDF_PASSWORD_REQUIRED rather than failing to decode.")
+
+    print(f"\nSubmitting {len(submissions)} document(s) over HTTP, polling like the HRM will.\n")
+    print(f"{'#':<4}{'kind':<7}{'verdict':<12}{'sig':<7}{'approve':<9}{'ms':>7}  message")
+    print("-" * 90)
 
     outcomes: dict[str, int] = {}
-    for index, (front, back) in enumerate(pairs, start=1):
+    for index, (front, back) in enumerate(submissions, start=1):
         started = time.perf_counter()
-        response = client.post(
-            "/v1/verify/upload",
-            files={
-                "front": (front.name, front.read_bytes(), "image/jpeg"),
-                "back": (back.name, back.read_bytes(), "image/jpeg"),
-            },
-        )
+
+        payload = {"front": (front.name, front.read_bytes(), content_type_for(front))}
+        if back is not None:
+            payload["back"] = (back.name, back.read_bytes(), content_type_for(back))
+
+        data = {}
+        if arguments.password and looks_like_a_pdf(front):
+            data["password"] = arguments.password
+
+        response = client.post("/v1/verify/upload", files=payload, data=data)
         if response.status_code >= 300:
             print(f"{index:<6}HTTP {response.status_code}  {response.text[:60]}")
             outcomes["HTTP_ERROR"] = outcomes.get("HTTP_ERROR", 0) + 1
@@ -162,7 +242,9 @@ def main() -> int:
             time.sleep(0.5)
 
         elapsed = int((time.perf_counter() - started) * 1000)
-        _summarise(index, body, elapsed, outcomes)
+        _summarise(
+            index, "PDF" if looks_like_a_pdf(front) else "images", body, elapsed, outcomes
+        )
 
     print("\n" + "=" * 60)
     total = sum(outcomes.values())
@@ -189,7 +271,9 @@ def main() -> int:
     return 0
 
 
-def _summarise(index: int, body: dict, elapsed_ms: int, outcomes: dict[str, int]) -> None:
+def _summarise(
+    index: int, kind: str, body: dict, elapsed_ms: int, outcomes: dict[str, int]
+) -> None:
     """Print one result.
 
     ⛔ PRIVACY-CRITICAL. `result` also carries `identity` and `address` — a real
@@ -210,11 +294,46 @@ def _summarise(index: int, body: dict, elapsed_ms: int, outcomes: dict[str, int]
     #    database CHECK constraint enforces. Two places, one rule.
     approve = verdict == "VERIFIED" and proof.get("valid") is True
 
+    # ★ Cross-check the `decision` block the front end actually reads against
+    #   the rule computed independently above. They are derived by different
+    #   code in different places; if they ever disagree, the front end is being
+    #   told something the database would refuse to store.
+    decision = body.get("decision") or {}
+    if decision:
+        if (decision.get("status") == "APPROVED") != approve:
+            print(
+                f"    ⛔ decision.status={decision.get('status')} but "
+                f"verdict/signature says approve={approve} — THESE MUST AGREE"
+            )
+            outcomes["DECISION_DISAGREEMENT"] = outcomes.get("DECISION_DISAGREEMENT", 0) + 1
+
     print(
-        f"{index:<6}{verdict!s:<12}{proof.get('valid')!s:<7}"
+        f"{index:<4}{kind:<7}{verdict!s:<12}{proof.get('valid')!s:<7}"
         f"{approve!s:<9}{elapsed_ms:>7}  "
         f"{(result.get('user_message') or '')[:34]}"
     )
+
+    # ⛔ THE ERROR CODE, whenever something failed.
+    #
+    #    Without it every ingest failure prints the same sentence — "we could
+    #    not open your photos" — whether the cause was a missing PDF renderer,
+    #    a wrong password, or a corrupt file. Those need completely different
+    #    fixes, and the generic message reads as "your documents are broken",
+    #    which sends someone hunting for a problem with the wrong thing.
+    #
+    # ⚠ Codes only. No filenames, no payloads, no identity fields — this line
+    #   is meant to be safe to paste into a chat.
+    errors = [s.get("error") for s in (result.get("sides") or []) if s.get("error")]
+    if errors:
+        print(f"       error: {', '.join(sorted(set(errors)))}")
+    elif verdict not in ("VERIFIED", "PENDING"):
+        failed_checks = [
+            f"{c.get('name')}={c.get('result')}"
+            for c in (result.get("checks") or [])
+            if c.get("result") == "FAIL"
+        ]
+        if failed_checks:
+            print(f"       failed: {', '.join(failed_checks)}")
 
 
 if __name__ == "__main__":

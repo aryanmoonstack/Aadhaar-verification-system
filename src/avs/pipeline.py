@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from avs.contracts import (
     CardSide,
@@ -76,16 +76,28 @@ __all__ = ["DocumentVerifier", "SideInput"]
 
 @dataclass(frozen=True, slots=True)
 class SideInput:
-    """One uploaded image plus which face of the card it claims to be.
+    """One uploaded file plus which face of the card it claims to be.
 
     The ``side`` label is metadata from the upload form — it says which slot the
     employee used, not which face the image actually shows. Nothing in the
     pipeline trusts it for decoding; it is used only for reporting and guidance.
+
+    ⚠ One SideInput is one *upload*, not one image. Since CONTRACTS.md 2.0.0 the
+      bytes may be a PDF, which ingest expands into several pages. The pipeline
+      searches all of them — see ``_process_side``.
     """
 
     side: CardSide
     data: bytes
     filename: str | None = None
+
+    password: str | None = None
+    """For an encrypted PDF. e-Aadhaar files downloaded from UIDAI are
+    password-protected, so this is routine rather than exceptional.
+
+    ⛔ Held in memory for the life of one ``verify()`` call and never written
+       anywhere. It must not reach a log, an audit entry or an error message —
+       ``avs.ingest.pdf`` is careful about this and so is everything here."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +128,57 @@ class _SideResult:
     """Which named problems the assessor found — 'blurry', 'too_dark', and so
     on. Captured at assessment time so the failure message needs no second pass
     over the pixels."""
+
+
+def _replace_variants(result: _SideResult, total: int) -> _SideResult:
+    """Rewrite ``variants_tried`` to the total across every page of one upload.
+
+    ⚠ Without this the count reports only the page that happened to win, which
+      understates the real work whenever a PDF's QR was not on page one. The
+      decode-cost metrics are read to decide whether the time budget is right,
+      so an understated count would argue for a budget that cannot hold.
+    """
+    if result.outcome.variants_tried == total:
+        return result
+    return replace(
+        result,
+        outcome=result.outcome.model_copy(update={"variants_tried": total}),
+    )
+
+
+#: How useful a non-Secure-QR page is, when no Secure QR was found anywhere.
+#: Higher wins. Ordering, not scoring — the gaps carry no meaning.
+_USEFULNESS: dict[str | None, int] = {
+    PayloadKind.LEGACY_XML.value: 3,  # "download a fresh e-Aadhaar" — actionable
+    PayloadKind.FOREIGN.value: 2,  # "that is a code, but not an Aadhaar one"
+    None: 0,  # nothing found; only the generic message
+}
+
+
+def _better_result(current: _SideResult | None, candidate: _SideResult) -> _SideResult:
+    """Pick the more informative of two pages, once no Secure QR is in play.
+
+    ⛔ Not arbitrary, and not "the first one". A page carrying a LEGACY QR earns
+       the employee "this is an older Aadhaar, download a fresh one" — advice
+       they can act on. A blank page earns only "we could not read the code".
+
+       Preferring the first page would let a cover sheet silence the diagnosis
+       from the page that actually held something.
+    """
+    if current is None:
+        return candidate
+
+    current_rank = _USEFULNESS.get(current.outcome.payload_kind, 1)
+    candidate_rank = _USEFULNESS.get(candidate.outcome.payload_kind, 1)
+    if candidate_rank > current_rank:
+        return candidate
+
+    # Tie on payload: a page where the decoder SAW a code beats one where it
+    # saw nothing at all.
+    if candidate_rank == current_rank:
+        if candidate.outcome.foreign_qr_found and not current.outcome.foreign_qr_found:
+            return candidate
+    return current
 
 
 #: How sure the classifier must be before its wording is used at all.
@@ -526,7 +589,17 @@ class DocumentVerifier:
         started = time.perf_counter()
 
         try:
-            image = self.ingestor.ingest(side.data, filename=side.filename)
+            # ⛔ ingest_ALL, not ingest. A PDF expands to several pages and the
+            #    Secure QR is frequently not on the first one — an e-Aadhaar
+            #    routinely carries it on a later page. Reading only page one
+            #    would report a perfectly valid document as UNREADABLE, and the
+            #    employee would re-upload the same file to the same result.
+            #
+            #    For an image this returns exactly one entry, so the ordinary
+            #    path is unchanged.
+            pages = self.ingestor.ingest_all(
+                side.data, filename=side.filename, password=side.password
+            )
         except IngestError as exc:
             return _SideResult(
                 CardSideOutcome(
@@ -538,9 +611,58 @@ class DocumentVerifier:
                 None,
             )
 
+        best: _SideResult | None = None
+        attempted = 0
+
+        for image in pages:
+            page_result = self._process_page(side, image, deadline, started)
+            attempted += page_result.outcome.variants_tried
+
+            # ⛔ STOP ONLY FOR A SECURE QR, NOT FOR ANY DECODE.
+            #
+            #    An e-Aadhaar PDF routinely carries more than one QR: a small
+            #    legacy or address-slip code as well as the signed Secure QR,
+            #    often on different pages. Returning at the first page that
+            #    decoded ANYTHING meant a legacy code on page 1 ended the
+            #    search, and the Secure QR on a later page was never seen.
+            #
+            #    The document then came back LEGACY_FORMAT — "this is an older
+            #    Aadhaar, download a fresh one" — for a perfectly current card.
+            #    The employee cannot act on that: downloading again produces the
+            #    same PDF and the same wrong answer.
+            #
+            #    ⚠ Found on the first three real e-Aadhaar PDFs ever tested.
+            #      Every synthetic fixture had exactly one QR, so no test could
+            #      have caught it.
+            if page_result.outcome.payload_kind == PayloadKind.SECURE_QR.value:
+                # Report the honest total across pages, not just the winner's.
+                # Otherwise `variants_tried` understates the work and the
+                # decode-rate metrics quietly lie about cost.
+                return _replace_variants(page_result, attempted)
+
+            best = _better_result(best, page_result)
+
+        # No Secure QR anywhere. `best` holds the most informative thing found —
+        # a legacy QR if there was one, so the verdict is LEGACY_FORMAT rather
+        # than UNREADABLE, which is a materially better message.
+        assert best is not None
+        return _replace_variants(best, attempted)
+
+    def _process_page(
+        self,
+        side: SideInput,
+        image: ValidatedImage,
+        deadline: float,
+        started: float,
+    ) -> _SideResult:
+        """Decode one already-ingested image. One page, or one whole photo."""
         # Whatever budget the previous side left behind. Never negative — a side
         # that gets no time still tries its first (cheapest) variant, because
         # that is where most captures decode anyway.
+        #
+        # ⚠ Recomputed per page, so a multi-page PDF shares one document budget
+        #   rather than being granted a fresh one per page. Four pages at a
+        #   5-second budget must still total five seconds.
         remaining = max(0.05, deadline - time.perf_counter())
         bounded = QrDecoderCascade(
             decoders=self.cascade.decoders,  # reuse — constructing detectors is not free
@@ -656,7 +778,23 @@ class DocumentVerifier:
                 result=CheckResult.PASS,
                 detail="both sides carry the same payload",
             )
-        # Only one side had a QR — normal for a PVC card, and nothing to compare.
+        # ⚠ Two different situations reach SKIP, and they must not be conflated.
+        #
+        #   1. Two faces were submitted and only one carried a QR — normal for a
+        #      PVC card, and it means the OTHER photo was unusable.
+        #   2. A single document was submitted (a PDF, §11). Nothing was unclear;
+        #      there was simply never a second file.
+        #
+        # `messages.py` turns case 1 into "one of the photos was unclear". Saying
+        # that to someone who uploaded one PDF is nonsense — they would go hunting
+        # for a bad photo that does not exist.
+        if len(results) < 2:
+            return CheckOutcome(
+                name=CheckName.SIDE_AGREEMENT,
+                result=CheckResult.SKIP,
+                detail="single document submitted; nothing to compare",
+            )
+
         return CheckOutcome(
             name=CheckName.SIDE_AGREEMENT,
             result=CheckResult.SKIP,

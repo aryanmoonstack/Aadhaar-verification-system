@@ -21,9 +21,19 @@ the bytes, so it must not itself be a parser with an attack surface. It reads a
 few dozen bytes and compares them to known signatures. That is all it does.
 
 Detecting a *disallowed* type precisely still matters: telling an employee
-"PDF is not supported, please photograph the card" is a far better experience
+"GIF images are not supported, please upload a JPEG" is a far better experience
 than a generic rejection — and telling ops "that was a ZIP archive" is far more
 useful than "invalid file".
+
+⚠ PDF IS ACCEPTED AS OF CONTRACTS.md 2.0.0
+   It was refused by name until then, and the refusal was asserted by tests.
+   Detection here is unchanged — ``%PDF-`` was always recognised. What changed
+   is the verdict on that detection.
+
+   Note what "accepted" means at this layer and no further: the bytes are
+   permitted past the allow-list. They are still not an image. ``validator.py``
+   routes them through ``avs.ingest.pdf`` first, because Pillow cannot open a
+   PDF and every stage after ingest is written against pixels.
 """
 
 from __future__ import annotations
@@ -43,13 +53,14 @@ class FileKind(str, Enum):
     WEBP = "webp"
     HEIF = "heif"
 
+    #: Accepted since CONTRACTS.md 2.0.0. Not an image — rendered to images by
+    #: ``avs.ingest.pdf`` before anything downstream sees it.
+    PDF = "pdf"
+
     # Images we recognise but do not accept
     GIF = "gif"
     BMP = "bmp"
     TIFF = "tiff"
-
-    # Explicitly named so the user gets a useful message
-    PDF = "pdf"
 
     # Actively dangerous
     ZIP = "zip"  # also .docx / .xlsx / .jar
@@ -76,16 +87,29 @@ class FileKind(str, Enum):
 
     @property
     def is_accepted(self) -> bool:
+        return self in {
+            FileKind.JPEG,
+            FileKind.PNG,
+            FileKind.WEBP,
+            FileKind.HEIF,
+            FileKind.PDF,
+        }
+
+    @property
+    def is_image(self) -> bool:
+        """True for formats Pillow can open directly.
+
+        ⚠ Not the same question as ``is_accepted``. PDF is accepted and is not an
+          image — it must be rendered first. Keeping the two questions separate
+          is what stops a PDF reaching ``Image.open``, which cannot open one and
+          would report it as a corrupt photo.
+        """
         return self in {FileKind.JPEG, FileKind.PNG, FileKind.WEBP, FileKind.HEIF}
 
     @property
     def rejection_reason(self) -> str:
         """A message an employee can act on, not a stack trace."""
         return {
-            FileKind.PDF: (
-                "PDF files are not supported. Please upload a photo or scan of "
-                "your Aadhaar card as an image."
-            ),
             FileKind.GIF: "GIF images are not supported. Please upload a JPEG or PNG photo.",
             FileKind.BMP: "BMP images are not supported. Please upload a JPEG or PNG photo.",
             FileKind.TIFF: "TIFF images are not supported. Please upload a JPEG or PNG photo.",
@@ -93,15 +117,22 @@ class FileKind(str, Enum):
             FileKind.EXECUTABLE: "This file is not an image.",
             FileKind.SCRIPT: "This file is not an image.",
             FileKind.UNKNOWN: (
-                "This file could not be recognised as an image. Please upload a "
-                "JPEG, PNG, HEIC or WebP photo."
+                "This file could not be recognised. Please upload a JPEG, PNG, "
+                "HEIC or WebP photo, or your Aadhaar PDF."
             ),
         }.get(self, "This file type is not supported.")
 
 
 #: MIME types the pipeline accepts. Mirrors CONTRACTS.md §9.
 ALLOWED_MIME_TYPES: frozenset[str] = frozenset(
-    {"image/jpeg", "image/png", "image/webp", "image/heif", "image/heic"}
+    {
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+        "image/heif",
+        "image/heic",
+        "application/pdf",
+    }
 )
 
 

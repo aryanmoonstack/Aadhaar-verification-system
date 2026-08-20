@@ -1,0 +1,27 @@
+{
+  "_comment": [
+    "Tenant registry. SAFE TO COMMIT — it holds no secret.",
+    "",
+    "`secret_env` names an ENVIRONMENT VARIABLE; the secret itself lives only in",
+    "that variable, never in this file. That is why this can sit in git and in a",
+    "Kubernetes ConfigMap without a second thought.",
+    "",
+    "`tenant_id` must match AVS_TENANT_ID in the Next.js app, exactly. It is an",
+    "identifier, not a secret.",
+    "",
+    "Generate the secret at deploy time, straight into your secret store:",
+    "    openssl rand -hex 32",
+    "and set the SAME value on both sides:",
+    "    AVS side     AVS_TENANT_M_ONE_PROD_SECRET",
+    "    Next.js side AVS_SECRET"
+  ],
+  "tenants": [
+    {
+      "tenant_id": "m-one-prod",
+      "name": "M-One HRM",
+      "secret_env": "AVS_TENANT_M_ONE_PROD_SECRET",
+      "strictness": "STANDARD",
+      "time_budget_seconds": 5.0
+    }
+  ]
+}

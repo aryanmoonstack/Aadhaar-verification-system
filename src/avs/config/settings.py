@@ -51,7 +51,33 @@ class Settings(BaseSettings):
     min_height: int = Field(default=480)
     max_dimension: int = Field(default=12_000)
     allowed_mime_types: tuple[str, ...] = Field(
-        default=("image/jpeg", "image/png", "image/heic", "image/heif", "image/webp")
+        default=(
+            "image/jpeg",
+            "image/png",
+            "image/heic",
+            "image/heif",
+            "image/webp",
+            "application/pdf",
+        )
+    )
+
+    # ── PDF (CONTRACTS.md 2.0.0) ─────────────────────────────────────────────
+    pdf_render_dpi: int = Field(
+        default=300,
+        description="⚠ Below ~150 the Secure QR falls under 2.0 pixels per module "
+        "and stops decoding. See avs.ingest.pdf.DEFAULT_RENDER_DPI for the arithmetic.",
+    )
+    pdf_max_pages: int = Field(
+        default=4,
+        description="Pages beyond this are ignored. Bounds a PDF that declares "
+        "thousands of pages, which is a denial of service rather than a document.",
+    )
+    pdf_max_pixels_per_byte: float = Field(
+        default=1000.0,
+        description="⛔ Deliberately far above the 150 used for photographs. "
+        "Rendered pages are mostly flat white and compress far better — a "
+        "near-blank A4 page measures 262 px/byte, so the photograph limit "
+        "would reject valid e-Aadhaar pages. max_pixels still bounds memory.",
     )
     enable_malware_scan: bool = Field(default=False, description="Requires ClamAV")
 

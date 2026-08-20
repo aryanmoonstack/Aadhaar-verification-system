@@ -22,12 +22,14 @@ included. Orientation is applied first so the image stays upright.
 
 from avs.ingest.errors import IngestError
 from avs.ingest.magic import ALLOWED_MIME_TYPES, DetectedType, FileKind, detect
+from avs.ingest.pdf import PDFIUM_AVAILABLE, RenderedPage, render_pdf
 from avs.ingest.scanner import ClamAvScanner, MalwareScanner, NullScanner, ScanResult
 from avs.ingest.validator import HEIF_AVAILABLE, ImageIngestor
 
 __all__ = [
     "ALLOWED_MIME_TYPES",
     "HEIF_AVAILABLE",
+    "PDFIUM_AVAILABLE",
     "ClamAvScanner",
     "DetectedType",
     "FileKind",
@@ -35,6 +37,8 @@ __all__ = [
     "IngestError",
     "MalwareScanner",
     "NullScanner",
+    "RenderedPage",
     "ScanResult",
     "detect",
+    "render_pdf",
 ]
