@@ -1,0 +1,9 @@
+# SHA-256 fingerprints of trusted UIDAI certificates.
+# Only certificates listed here are loaded. See certs/README.md.
+# Written by `avs certs pin` on 2026-08-20.
+
+e0304b9e61ee3640ecddae2db4b617f2e2678f57dbc2826c2f86ac5c04f277df  uidai_offline_publickey_2026.cer
+00573c692cf04fbee113ae5fd52f2a654d361bf8ee4d06c46008906b36df8169  uidai_offline_publickey_17022026.cer
+e0f0f869d32efc7e80fae2223717a56dcf8b616f820b542a49e5bd5abf1c0f7d  uidai_offline_publickey_26022021.cer
+e0f5596d2c48e19f9cc184bccde7129e2d8987f905c73b87d1851c35c622d852  uidai_offline_publickey_29032019.cer
+35575c63c72106e803511004f94bfda54952b2cf2184c3ce1aad61f1964c58d0  uidai_offline_publickey_26022019.cer
