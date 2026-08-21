@@ -197,7 +197,14 @@ class TestDecisionTable:
             None,
         )
         assert result.verdict is Verdict.UNREADABLE
-        assert "could not open your photos" in result.user_message.lower()
+
+        # ⚠ The message is now specific to the ERROR CODE, not a single generic
+        #   sentence for all nine ingest failures. This asserted the old shared
+        #   wording, which meant a corrupt file and a locked PDF read identically
+        #   — see tests/unit/test_ingest_messages.py.
+        message = result.user_message.lower()
+        assert "damaged or incomplete" in message
+        assert "please" in message, "a diagnosis without an action leaves them stuck"
 
     def test_no_evidence_at_all_is_error(self, engine) -> None:
         assert engine.decide([], None).verdict is Verdict.ERROR

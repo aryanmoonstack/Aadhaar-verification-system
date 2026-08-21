@@ -26,7 +26,7 @@ no idiom, no cultural assumptions.
 
 from __future__ import annotations
 
-from avs.contracts import CheckName, CheckOutcome, CheckResult, Verdict
+from avs.contracts import CheckName, CheckOutcome, CheckResult, ErrorCode, Verdict
 
 __all__ = ["MESSAGES", "message_for"]
 
@@ -68,6 +68,79 @@ MESSAGES: dict[Verdict, str] = {
 }
 
 
+#: What to say when the file never got past the security boundary.
+#:
+#: ⛔ WHY THIS TABLE EXISTS
+#:
+#:    Nine distinct ingest failures used to collapse into one sentence:
+#:    "We could not open your file." An employee whose photo was 30 MB, one who
+#:    uploaded a GIF, and one whose PDF was locked all read the same words and
+#:    none of them learned what to do.
+#:
+#:    Worse, the generic text mentioned photos. Someone holding a perfectly good
+#:    e-Aadhaar PDF was told to upload clearer JPEGs — advice they cannot act on,
+#:    about a problem they do not have. Observed in the first real HRM
+#:    integration test.
+#:
+#: ⚠ Every entry names an ACTION. "This file is too large" is a diagnosis;
+#:   "please upload a smaller photo" is something a person can do next.
+INGEST_MESSAGES: dict[ErrorCode, str] = {
+    ErrorCode.PDF_PASSWORD_REQUIRED: (
+        "This PDF is password-protected. Please enter its password — for an "
+        "e-Aadhaar it is the first 4 letters of the name in CAPITALS followed by "
+        "the year of birth, for example RAME1990."
+    ),
+    # ⛔ Does NOT say "your password was wrong", and deliberately so.
+    #
+    #    Two reasons. First, the renderer reports the same code for a wrong
+    #    password and for an encryption scheme it cannot handle, so asserting
+    #    which one happened would be a guess presented as a fact.
+    #
+    #    Second, and more important: the HRM usually DERIVES this password from
+    #    the employee's profile, so in the common case the employee typed
+    #    nothing at all. Telling them their password was wrong blames them for
+    #    our guess — and the guess misses routinely, whenever the profile name
+    #    differs from the name printed on the Aadhaar.
+    ErrorCode.PDF_PASSWORD_INCORRECT: (
+        "We could not open this PDF with the password we tried. Please enter the "
+        "password for this file — for an e-Aadhaar it is the first 4 letters of "
+        "the name in CAPITALS followed by the year of birth, for example RAME1990."
+    ),
+    ErrorCode.FILE_TOO_LARGE: (
+        "This file is too large. Please upload a photo under 20 MB, or the "
+        "original Aadhaar PDF."
+    ),
+    ErrorCode.FILE_TOO_SMALL: (
+        "This image is too small to read the code. Please upload the full-size "
+        "original rather than a thumbnail, a screenshot, or a copy forwarded "
+        "through a messaging app."
+    ),
+    ErrorCode.UNSUPPORTED_MIME_TYPE: (
+        "We cannot read this type of file. Please upload a JPEG, PNG or HEIC "
+        "photo, or your Aadhaar PDF."
+    ),
+    ErrorCode.CORRUPT_IMAGE: (
+        "This file appears to be damaged or incomplete. Please download it again, "
+        "or take a fresh photo of your Aadhaar card."
+    ),
+    ErrorCode.DIMENSIONS_INVALID: (
+        "This image is not a size we can read. Please upload an ordinary "
+        "full-resolution photo taken with a camera."
+    ),
+    ErrorCode.DECOMPRESSION_BOMB: (
+        "We could not process this file. Please upload an ordinary camera photo, "
+        "or the original Aadhaar PDF."
+    ),
+    # ⛔ States what happened, accuses nobody. A scanner false positive is far
+    #    more likely than an employee attaching malware to their own Aadhaar, and
+    #    the wording must not imply otherwise.
+    ErrorCode.MALWARE_DETECTED: (
+        "This file was blocked by a security scan. Please upload a photo taken "
+        "directly with your camera, or download a fresh e-Aadhaar PDF."
+    ),
+}
+
+
 def message_for(verdict: Verdict, checks: dict[CheckName, CheckOutcome]) -> str:
     """The message shown to the employee.
 
@@ -77,16 +150,35 @@ def message_for(verdict: Verdict, checks: dict[CheckName, CheckOutcome]) -> str:
     """
     base = MESSAGES[verdict]
 
+    # ⛔ Runs for BOTH verdicts a failed ingest can produce.
+    #
+    #    A file that never passed validation yields UNREADABLE normally, but
+    #    ERROR when the fault is ours (an empty trust store, for instance). The
+    #    check was previously nested under UNREADABLE alone, so an ingest failure
+    #    arriving as ERROR silently lost its specific message and fell back to
+    #    "please try again shortly" — advice that will never work, because
+    #    nothing about the file changes on a retry.
+    validation = checks.get(CheckName.FILE_VALIDATION)
+    if (
+        verdict in (Verdict.UNREADABLE, Verdict.ERROR)
+        and validation is not None
+        and validation.result is CheckResult.FAIL
+        and validation.error is not None
+        and validation.error in INGEST_MESSAGES
+    ):
+        return INGEST_MESSAGES[validation.error]
+
     if verdict is Verdict.UNREADABLE:
-        validation = checks.get(CheckName.FILE_VALIDATION)
         if validation is not None and validation.result is CheckResult.FAIL:
-            # We never got as far as looking for a QR. Saying "we could not read
-            # the QR code" would send the employee off to fix their lighting when
-            # the file itself was the problem.
+            # Reached only for an ingest failure with no entry in
+            # INGEST_MESSAGES — a new ErrorCode that nobody has written wording
+            # for yet. We never got as far as looking for a QR, so "we could not
+            # read the QR code" would send the employee off to fix their
+            # lighting when the file itself was the problem.
             return (
-                "We could not open your photos. Please upload clear, "
-                "full-resolution JPEG or PNG images of both sides of your "
-                "Aadhaar card."
+                "We could not open your file. Please upload a clear, "
+                "full-resolution photo of both sides of your Aadhaar card, "
+                "or your Aadhaar PDF."
             )
 
         decoded = checks.get(CheckName.QR_DECODED)

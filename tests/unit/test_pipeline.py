@@ -184,7 +184,14 @@ class TestOneSideUnreadable:
         result = make_verifier(keypair).verify(sides(junk, junk))
         assert result.verdict is Verdict.UNREADABLE
         assert result.is_auto_approve is False
-        assert "could not open your photos" in result.user_message.lower()
+
+        # ⚠ The message names the ACTUAL fault now, not one generic sentence for
+        #   every ingest failure. `junk` is 103 bytes, so FILE_TOO_SMALL is
+        #   right — and it is better advice than the old "could not open your
+        #   photos", which described a problem this file does not have.
+        message = result.user_message.lower()
+        assert "too small" in message
+        assert "please" in message
 
 
 # --------------------------------------------------------------------------- #

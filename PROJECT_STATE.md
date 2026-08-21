@@ -98,7 +98,8 @@ module is implemented or its interface changes.**
 | `observability/` | 9 | ✅ **folded into `api/`** | `avs_decode_rate` + per-stage counters, `RequestContextMiddleware` correlation ids | ops |
 | `ai/modelmgr/` | 12 | ✅ **DONE** | `ModelSpec`, `ModelRegistry`, `load_registry()`, `RegistryError`, `ModelRunner`, `InferenceSession`, `InferenceOutcome`, `onnxruntime_available()` | all `ai/` modules (13–19) |
 | `ai/classify/` | 13 | ✅ **DONE** | `build_classifier()`, `HeuristicClassifier`, `OnnxDocumentClassifier`, `DocumentFeatures`, `extract_features()`, `CLASS_ORDER` | `pipeline` (optional), CLI |
-| `ai/quality/` | 14 | ⬜ stub | `assess() -> QualityScores` | `imaging/` |
+| `ai/quality/` | 14 | ✅ **DONE** | `measure_quality()`, `QualityMetrics`, `QualityAssessor.assess()/assess_detailed()`, measured thresholds | `imaging/`, `pipeline` |
+| `ingest/pdf.py` | 3.5 | ✅ **DONE** | `render_pdf()`, `RenderedPage`, `PDFIUM_AVAILABLE` — PDF pages to images at the ingest boundary | `ingest/validator.py` only |
 | `ai/localize/` | 15 | ⬜ stub | `localize() -> QrRegion` | `qr/` |
 | `ocr/` | 17 | ⬜ stub | `cross_check() -> TextSimilarity` | `rules/` |
 | `matching/` | 18 | ⬜ stub | `bind() -> MatchOutcome` | `rules/` |
